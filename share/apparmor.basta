@@ -1,0 +1,35 @@
+# /etc/apparmor.d/basta
+#
+# AppArmor profile for the basta launcher binary.
+#
+# Ubuntu 24.04 enables kernel.apparmor_restrict_unprivileged_userns=1
+# which strips capabilities from a process that unshares CLONE_NEWUSER
+# unless the binary matches an AppArmor profile granting `userns`.
+# basta unshares user+net namespaces in its child before exec'ing bwrap
+# (so bwrap inherits the configured netns via --share-net); without
+# this profile, the unshare succeeds but subsequent writes to
+# /proc/self/setgroups and /proc/self/uid_map return EACCES.
+#
+# The profile is `flags=(unconfined)` — basta is the trusted launcher,
+# not the sandboxed agent. The agent's confinement is bwrap's mount
+# namespace + nftables egress filter, not AppArmor on basta.
+#
+# The attachment must match the binary that actually runs. Since v0.5.6
+# the default install is the user prefix (~/.local/bin/basta), so the set
+# below covers both that (under /home/*/ and /root) and system-wide
+# PREFIX=/usr/local and PREFIX=/usr (distro-package) installs. A profile
+# pinned only to one path leaves the others unconfined, and userns creation
+# on the egress path is then denied (setgroups EPERM).
+#
+# Note: the brace set must keep the leading "/" outside the "{…}", and
+# the @{HOME} tunable is avoided. An attachment that begins with "{"
+# collides with the profile-body brace (parser reads it as the rules
+# block), and @{HOME} expands to its own brace set, which nests badly.
+# The /{a,b}/… form below is the standard AppArmor idiom.
+
+abi <abi/4.0>,
+include <tunables/global>
+
+profile basta /{usr,usr/local,home/*/.local,root/.local}/bin/basta flags=(unconfined) {
+    userns,
+}

@@ -1,0 +1,28 @@
+# /etc/apparmor.d/bwrap
+#
+# Minimal AppArmor profile for /usr/bin/bwrap on Ubuntu 24.04+.
+#
+# 24.04 ships kernel.apparmor_restrict_unprivileged_userns=1 by default,
+# which blocks unconfined apps from creating user namespaces. Without a
+# matching profile bubblewrap fails with cryptic errors.
+#
+# This profile attaches to /usr/bin/bwrap and grants:
+#   - userns (so bwrap can create the new user namespace)
+#
+# Nothing else. The mount namespace, the user namespace's reset
+# capability set, and our nftables rules are the security boundary —
+# AppArmor's role here is only to satisfy
+# kernel.apparmor_restrict_unprivileged_userns=1 (F13).
+#
+# Install:
+#   sudo install -m 0644 share/apparmor.bwrap /etc/apparmor.d/bwrap
+#   sudo apparmor_parser -r /etc/apparmor.d/bwrap
+#
+# basta-host-setup automates this when the kernel sysctl path isn't acceptable.
+
+abi <abi/4.0>,
+include <tunables/global>
+
+profile bwrap /usr/bin/bwrap flags=(unconfined) {
+    userns,
+}

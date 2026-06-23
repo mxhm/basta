@@ -1,0 +1,676 @@
+#!/bin/bash
+# basta-verify — prove the basta sandbox denies what it should deny.
+#
+# Categories (default: all except --gpu-present):
+#   --host         Host inventory: deps + AppArmor; no v0.2/v0.3 leftovers.
+#   --network      --allow egress: allowed dest reachable, others blocked,
+#                  offline default blocked, --allow :53/udp enables DNS.
+#   --sni          --allow-sni egress: allowed SNI reachable; off-allowlist
+#                  SNI, no-SNI direct-IP, IPv6 :443, HTTP/3 all blocked.
+#   --filesystem   /etc/shadow etc. invisible; workspace RW; RO bind RW-blocked.
+#   --ephemeral    $HOME is tmpfs; --seed copies in; --persist survives.
+#   --namespaces   Sandbox in its own user/net/pid/cgroup namespaces.
+#   --seccomp      Agent seccomp denylist: dangerous syscalls EPERM'd,
+#                  dev syscalls intact, 32-bit (i386-ABI) binaries killed.
+#   --gpu-absent   By default (GPU off), /dev/nvidia* must not be present.
+#   --gpu-present  With --gpu, nvidia-smi must work.
+#   --audit        Replay proc/netns findings (F8 F9 F14 F15 F16 F17 F18).
+#
+# The --network and --audit egress probes reach the public internet. The
+# "allowed host is reachable" canary must be a host your egress policy actually
+# permits: in a default-deny enclave a neutral host like example.com is dropped
+# upstream and the probe times out (rc 28) even though basta is healthy. The
+# default is github.com — near-universally allowlisted, and basta itself
+# installs from it. Override for an air-gapped or differently-allowlisted host:
+#   BASTA_PROBE_HOST      reachable HTTPS host   (default: github.com)
+#   BASTA_PROBE_HOST_IP   literal IP for BASTA_PROBE_HOST (default: resolved at start)
+#   BASTA_PROBE_DNS       reachable UDP resolver (default: 1.1.1.1)
+#   BASTA_PROBE_DNS_NAME  name only that resolver knows (default: one.one.one.one)
+
+set -e
+
+export BASTA="${BASTA:-$(command -v basta)}"
+[ -x "$BASTA" ] || { echo "ERROR: basta not found"; exit 2; }
+
+PROBE_HOST="${BASTA_PROBE_HOST:-github.com}"
+PROBE_DNS="${BASTA_PROBE_DNS:-1.1.1.1}"
+PROBE_DNS_NAME="${BASTA_PROBE_DNS_NAME:-one.one.one.one}"
+
+# F2: --allow with a DNS name on :443 is refused; the egress probes pin a
+# literal IP and let curl map the name with --resolve. Override on an
+# air-gapped host together with BASTA_PROBE_HOST.
+PROBE_HOST_IP="${BASTA_PROBE_HOST_IP:-$(getent ahostsv4 "$PROBE_HOST" 2>/dev/null | awk 'NR==1{print $1}')}"
+
+do_host=0 do_network=0 do_sni=0 do_filesystem=0 do_ephemeral=0 do_namespaces=0
+do_seccomp=0 do_gpu_absent=0 do_gpu_present=0 do_audit=0
+
+while [ $# -gt 0 ]; do
+    case "$1" in
+        --host)         do_host=1; shift ;;
+        --network)      do_network=1; shift ;;
+        --sni)          do_sni=1; shift ;;
+        --filesystem)   do_filesystem=1; shift ;;
+        --ephemeral)    do_ephemeral=1; shift ;;
+        --namespaces)   do_namespaces=1; shift ;;
+        --seccomp)      do_seccomp=1; shift ;;
+        --gpu-absent)   do_gpu_absent=1; shift ;;
+        --gpu-present)  do_gpu_present=1; shift ;;
+        --audit)        do_audit=1; shift ;;
+        -h|--help)
+            sed -n '2,/^set -e$/{/^set -e$/q;p;}' "$0" | sed 's/^# \?//'
+            exit 0 ;;
+        *) echo "unknown option: $1" >&2; exit 2 ;;
+    esac
+done
+
+if [ "$do_host$do_network$do_sni$do_filesystem$do_ephemeral$do_namespaces$do_seccomp$do_gpu_absent$do_gpu_present$do_audit" = "0000000000" ]; then
+    do_host=1; do_network=1; do_sni=1; do_filesystem=1; do_ephemeral=1
+    do_namespaces=1; do_seccomp=1; do_gpu_absent=1; do_audit=1
+fi
+
+fails=0
+
+probe() {
+    local expect="$1" desc="$2"
+    shift 2
+    local rc
+    set +e
+    "$@" >/dev/null 2>&1
+    rc=$?
+    set -e
+    if [ "$expect" = "PASS" ]; then
+        if [ "$rc" -eq 0 ]; then echo "  ok      $desc"
+        else echo "  FAIL    $desc (rc=$rc)"; fails=$((fails+1)); fi
+    else
+        if [ "$rc" -ne 0 ]; then echo "  ok      $desc (denied as expected)"
+        else echo "  FAIL    $desc (rc=0, leak!)"; fails=$((fails+1)); fi
+    fi
+}
+
+check() {
+    local label="$1"; shift
+    if "$@" >/dev/null 2>&1; then echo "  ok      $label"
+    else echo "  FAIL    $label"; fails=$((fails+1)); fi
+}
+
+# Offline sandbox (the default --net none) for net-independent probes.
+# GPU is off by default, so the baseline ("none") sandbox is already
+# GPU-less — what the gpu-absent and isolation probes expect.
+in_sb_none() { "$BASTA" --net none /tmp -- "$@"; }
+
+# Diagnose a failed egress-baseline launch. The egress path has basta
+# itself unshare the user+net namespaces (unlike the offline path, which
+# delegates to bwrap), so it needs /etc/apparmor.d/basta to attach to the
+# binary that actually runs. A profile that exists but is pinned to a
+# different path (e.g. /usr/local while ~/.local/bin/basta runs) leaves basta
+# unconfined and the unshare fails with a setgroups/uid_map EPERM. Re-run
+# a minimal egress launch (unreachable TEST-NET-1 target, exits at once)
+# to capture stderr and surface that specific cause.
+egress_baseline_hint() {
+    local err
+    err=$("$BASTA" --allow 192.0.2.1:9/tcp /tmp -- /bin/true 2>&1 || true)
+    case "$err" in
+        *setgroups*|*uid_map*|*"unshare failed"*)
+            echo "  → unprivileged user namespaces are blocked for $BASTA."
+            if [ -e /proc/sys/kernel/apparmor_restrict_unprivileged_userns ]; then
+                echo "    Ubuntu/Debian (AppArmor): run basta-host-setup so the basta profile"
+                echo "    attaches to this binary's path."
+            elif [ -e /proc/sys/kernel/unprivileged_userns_clone ]; then
+                echo "    Debian: set kernel.unprivileged_userns_clone=1 (basta-host-setup does this)."
+            elif [ -e /proc/sys/user/max_user_namespaces ]; then
+                echo "    RHEL/Fedora: raise user.max_user_namespaces (basta-host-setup does this)."
+            else
+                echo "    run: basta-host-setup"
+            fi ;;
+    esac
+}
+
+# --- host inventory ---
+if [ "$do_host" = "1" ]; then
+    echo ""
+    echo "[host] inventory: deps + AppArmor; no v0.2/v0.3 leftovers."
+
+    check "basta binary is ELF (Rust build)" \
+        bash -c 'file "$BASTA" | grep -q ELF'
+    check "bubblewrap (bwrap) installed" command -v bwrap
+    check "nftables (nft) installed" \
+        bash -c 'command -v nft || test -x /usr/sbin/nft'
+    # passt/pasta is needed only for filtered egress — optional, and not packaged
+    # on some LTS (Ubuntu 22.04). Note its absence, don't fail the suite.
+    if command -v pasta >/dev/null 2>&1; then
+        check "passt (pasta) installed" command -v pasta
+    else
+        echo "  - passt (pasta) not installed — filtered egress (--allow*) unavailable;"
+        echo "    offline sandboxing works. (Ubuntu 22.04 ships no passt; install from upstream.)"
+    fi
+
+    # AppArmor profiles — required where the kernel gates unprivileged userns.
+    gate=/proc/sys/kernel/apparmor_restrict_unprivileged_userns
+    if [ -e "$gate" ] && [ "$(cat "$gate")" = "1" ]; then
+        basta_missing=0; bwrap_missing=0
+        test -f /etc/apparmor.d/basta   || basta_missing=1
+        test -f /etc/apparmor.d/bwrap || bwrap_missing=1
+        check "/etc/apparmor.d/basta profile installed" test -f /etc/apparmor.d/basta
+        check "/etc/apparmor.d/bwrap profile installed" test -f /etc/apparmor.d/bwrap
+        if [ "$basta_missing" = "1" ] || [ "$bwrap_missing" = "1" ]; then
+            echo "  → run: basta-host-setup  (installs and loads the AppArmor profiles)"
+        fi
+    else
+        # No AppArmor userns gate (Debian/RHEL/Fedora/etc.) — no basta profile is
+        # needed, but the namespace must still actually work. Probe it.
+        check "unprivileged user namespaces work (no AppArmor gate)" \
+            unshare --user --map-root-user true
+    fi
+fi
+
+# --- network ---
+if [ "$do_network" = "1" ]; then
+    echo ""
+    echo "[network] --allow egress: allowed reachable, others blocked."
+
+    # Guard: if the egress machinery itself can't launch, a blocked-probe
+    # failure would be indistinguishable from a launch failure.
+    if "$BASTA" --allow "$PROBE_HOST_IP:443" /tmp -- /bin/true >/dev/null 2>&1; then
+        probe PASS "ALLOWED $PROBE_HOST:443 reachable" \
+            "$BASTA" --allow "$PROBE_HOST_IP:443" /tmp -- \
+            /usr/bin/curl -sS --max-time 10 -o /dev/null \
+            --resolve "$PROBE_HOST:443:$PROBE_HOST_IP" "https://$PROBE_HOST/"
+
+        probe FAIL "BLOCKED 1.1.1.1:443 (not in --allow)" \
+            "$BASTA" --allow "$PROBE_HOST_IP:443" /tmp -- \
+            /usr/bin/curl -sS --max-time 5 -o /dev/null "https://1.1.1.1/"
+
+        probe PASS "ALLOWED live DNS via --allow $PROBE_DNS:53/udp" \
+            "$BASTA" --allow "$PROBE_DNS:53/udp" /tmp -- \
+            /usr/bin/getent hosts "$PROBE_DNS_NAME"
+
+        probe FAIL "BLOCKED DNS for non-pinned name (no resolver)" \
+            "$BASTA" --allow "$PROBE_HOST_IP:443" /tmp -- \
+            /usr/bin/getent hosts "$PROBE_DNS_NAME"
+
+        # The egress-mode agent must run unprivileged — not uid 0, no
+        # CAP_SYS_ADMIN — else it can remount the RO host binds writable
+        # and write the host filesystem (the F1 escape).
+        probe PASS "egress agent runs non-root (uid != 0)" \
+            "$BASTA" --allow "$PROBE_HOST_IP:443" /tmp -- \
+            /bin/sh -c '[ "$(id -u)" -ne 0 ]'
+
+        probe FAIL "egress agent cannot remount a RO host bind rw" \
+            "$BASTA" --allow "$PROBE_HOST_IP:443" /tmp -- \
+            /bin/sh -c 'mount -o remount,rw,bind /usr'
+    else
+        echo "  FAIL    basta --allow baseline launch failed; egress probes skipped"
+        egress_baseline_hint
+        fails=$((fails+1))
+    fi
+
+    # No --allow → offline; nothing is reachable.
+    probe FAIL "BLOCKED offline default ($PROBE_HOST)" \
+        in_sb_none /usr/bin/curl -sS --max-time 5 -o /dev/null "https://$PROBE_HOST/"
+
+    # F2: --allow with a DNS name on TCP :443 must be refused at preflight.
+    probe FAIL "REFUSED --allow DNS-name on :443 (F2)" \
+        "$BASTA" --allow "$PROBE_HOST:443" /tmp -- /bin/true
+fi
+
+# --- sni egress ---
+if [ "$do_sni" = "1" ]; then
+    echo ""
+    echo "[sni] --allow-sni: SNI allowlist enforced by the in-netns proxy."
+
+    # Guard: a blocked-probe failure must not be confused with a launch
+    # failure of the SNI machinery itself.
+    if "$BASTA" --allow-sni "$PROBE_HOST" /tmp -- /bin/true >/dev/null 2>&1; then
+        probe PASS "ALLOWED https://$PROBE_HOST via --allow-sni" \
+            "$BASTA" --allow-sni "$PROBE_HOST" /tmp -- \
+            /usr/bin/curl -sS --max-time 12 -o /dev/null "https://$PROBE_HOST/"
+
+        # Off-allowlist SNI: connect to a pinned IP with an unlisted name.
+        probe FAIL "BLOCKED off-allowlist SNI (proxy reject)" \
+            "$BASTA" --allow-sni "$PROBE_HOST" /tmp -- \
+            /usr/bin/curl -sS --max-time 8 -o /dev/null \
+            --resolve "off.example.invalid:443:198.51.100.9" \
+            "https://off.example.invalid/"
+
+        # No-SNI direct-IP :443 — redirected, no SNI → dropped.
+        probe FAIL "BLOCKED no-SNI direct-IP :443" \
+            "$BASTA" --allow-sni "$PROBE_HOST" /tmp -- \
+            /usr/bin/curl -sS --max-time 8 -o /dev/null "https://1.1.1.1/"
+
+        # The load-bearing property: the proxy ignores the client's chosen
+        # destination IP and dials the IP it resolved for the SNI itself.
+        probe PASS "ALLOWED proxy uses allowlisted name, not client dst IP" \
+            "$BASTA" --allow-sni "$PROBE_HOST" /tmp -- \
+            /usr/bin/curl -sS --max-time 12 -o /dev/null \
+            --resolve "$PROBE_HOST:443:198.51.100.9" "https://$PROBE_HOST/"
+
+        # IPv6 :443 is not redirected and not allowed — dropped by the
+        # inet filter's policy drop.
+        probe FAIL "BLOCKED IPv6 :443 egress (no v6 redirect)" \
+            "$BASTA" --allow-sni "$PROBE_HOST" /tmp -- \
+            /usr/bin/curl -sS --max-time 8 -o /dev/null -6 \
+            "https://[2606:4700:4700::1111]/"
+
+        # HTTP/3 / QUIC is UDP/443 — no UDP accept in the filter, so it is
+        # dropped; a client must fall back to TCP. Skipped if curl lacks it.
+        if /usr/bin/curl -V 2>/dev/null | grep -q HTTP3; then
+            probe FAIL "BLOCKED HTTP/3 (UDP/443 has no egress path)" \
+                "$BASTA" --allow-sni "$PROBE_HOST" /tmp -- \
+                /usr/bin/curl -sS --max-time 8 --http3-only -o /dev/null \
+                "https://$PROBE_HOST/"
+        else
+            echo "  ok      HTTP/3 probe skipped (curl lacks HTTP3)"
+        fi
+
+        # F4: the live SNI proxy holds only CAP_NET_ADMIN, not a full
+        # CapEff. Launch a held-open session and inspect /proc/<proxy>.
+        # The proxy is the `__sni-proxy` child of the launched basta parent
+        # (its argv[0] is /proc/self/exe, so match on the subcommand).
+        "$BASTA" --allow-sni "$PROBE_HOST" /tmp -- /bin/sleep 8 >/dev/null 2>&1 &
+        sni_bg=$!
+        sleep 3
+        proxy_pid=$(pgrep -P "$sni_bg" -f '__sni-proxy' 2>/dev/null || true)
+        if [ -n "$proxy_pid" ]; then
+            capeff=$(grep '^CapEff:' "/proc/$proxy_pid/status" 2>/dev/null | awk '{print $2}')
+            if [ -z "$capeff" ]; then
+                echo "  ok      F4 proxy CapEff probe skipped (status unreadable)"
+            elif [ "$capeff" = "0000000000001000" ]; then
+                echo "  ok      SNI proxy CapEff reduced to CAP_NET_ADMIN ($capeff)"
+            else
+                echo "  FAIL    SNI proxy CapEff=$capeff (expected 0000000000001000)"
+                fails=$((fails+1))
+            fi
+        else
+            echo "  ok      F4 proxy CapEff probe skipped (proxy not observed)"
+        fi
+        kill "$sni_bg" 2>/dev/null || true
+        wait "$sni_bg" 2>/dev/null || true
+    else
+        echo "  FAIL    basta --allow-sni baseline launch failed; sni probes skipped"
+        egress_baseline_hint
+        fails=$((fails+1))
+    fi
+fi
+
+# --- filesystem ---
+if [ "$do_filesystem" = "1" ]; then
+    echo ""
+    echo "[filesystem] sensitive paths blocked; workspace caller-uid writable."
+    probe FAIL "BLOCKED /etc/shadow read" in_sb_none /bin/cat /etc/shadow
+    probe FAIL "BLOCKED /root/.ssh list"  in_sb_none /bin/ls /root/.ssh
+    probe PASS "ALLOWED ls /tmp"          in_sb_none /bin/ls /tmp
+    probe PASS "ALLOWED touch /tmp"       in_sb_none /bin/sh -c "touch /tmp/.basta-write && rm /tmp/.basta-write"
+
+    rotmp=$(mktemp -d)
+    : > "$rotmp/marker"
+    probe PASS "ALLOWED ls of :ro mount"  "$BASTA" "$rotmp:ro" -- /bin/ls "$rotmp/marker"
+    probe FAIL "BLOCKED write to :ro"     "$BASTA" "$rotmp:ro" -- /bin/sh -c "touch '$rotmp/.x'"
+    rm -rf "$rotmp"
+
+    # F34: default sandbox sees only ~/.local/share/mise, not the rest
+    # of the host's ~/.local/share. --expose-local-share opts back in.
+    f34_canary="$HOME/.local/share/.basta-f34-canary"
+    : > "$f34_canary" 2>/dev/null && {
+        probe FAIL "BLOCKED host ~/.local/share exposure (F34)" \
+            in_sb_none /bin/cat "$f34_canary"
+        probe PASS "ALLOWED ~/.local/share with --expose-local-share" \
+            "$BASTA" --net none --expose-local-share /tmp -- /bin/cat "$f34_canary"
+        rm -f "$f34_canary"
+    }
+
+    rwtmp=$(mktemp -d)
+    "$BASTA" "$rwtmp" -- /bin/sh -c "echo hi > '$rwtmp/written'" >/dev/null 2>&1
+    expected_uid=$(id -u)
+    actual_uid=$(stat -c '%u' "$rwtmp/written" 2>/dev/null || echo "")
+    if [ "$actual_uid" = "$expected_uid" ]; then
+        echo "  ok      ALLOWED workspace write owned by caller (uid $actual_uid)"
+    else
+        echo "  FAIL    workspace write uid '$actual_uid', expected $expected_uid"
+        fails=$((fails+1))
+    fi
+    rm -rf "$rwtmp"
+
+    # Workspace lock: a sandboxed agent in a RW repo cannot plant a git hook,
+    # edit .git/config, or rename .git out of the way (host-code-exec via a
+    # later host git op); a normal commit still works; --unlock / --no-lock
+    # are the controls that prove the lock is what blocks it.
+    if command -v git >/dev/null 2>&1; then
+        gg=$(mktemp -d)
+        git -C "$gg" init -q
+        git -C "$gg" config user.email t@t; git -C "$gg" config user.name t
+        : > "$gg/f"; git -C "$gg" add f; git -C "$gg" commit -qm init >/dev/null 2>&1
+        probe FAIL "lock BLOCKS planting .git/hooks/pre-commit" \
+            "$BASTA" "$gg" -- /bin/sh -c 'echo x > .git/hooks/pre-commit'
+        probe FAIL "lock BLOCKS editing .git/config" \
+            "$BASTA" "$gg" -- /usr/bin/git config core.pager EVIL
+        probe FAIL "lock PINS .git (rename blocked)" \
+            "$BASTA" "$gg" -- /bin/sh -c 'mv .git .gx'
+        probe PASS "lock ALLOWS a normal commit" \
+            "$BASTA" "$gg" -- /bin/sh -c ': > g && git add g && git commit -qm two'
+        probe PASS "--unlock .git/hooks re-allows the plant (control)" \
+            "$BASTA" --unlock .git/hooks "$gg" -- /bin/sh -c 'echo x > .git/hooks/pre-commit'
+        probe PASS "--no-lock re-allows the plant (control)" \
+            "$BASTA" --no-lock "$gg" -- /bin/sh -c 'echo x > .git/hooks/post-merge'
+        rm -rf "$gg"
+    else
+        echo "  ok      lock probes skipped (git not installed)"
+    fi
+
+    # Post-run detection: a fresh autorun file (.envrc) can't be pre-blocked,
+    # so --lock-strict exits non-zero when the agent creates one; clean when
+    # it doesn't.
+    en=$(mktemp -d)
+    probe FAIL "--lock-strict flags a newly created .envrc" \
+        "$BASTA" --lock-strict "$en" -- /bin/sh -c 'echo export X=1 > .envrc'
+    rm -f "$en/.envrc"
+    probe PASS "--lock-strict clean when no autorun file is created" \
+        "$BASTA" --lock-strict "$en" -- /bin/true
+    rm -rf "$en"
+fi
+
+# --- ephemeral / seed / persist ---
+# SC2016: $HOME in single-quoted sandbox commands is intentional — it
+# must reach the sandbox shell unexpanded so it resolves there, not here.
+# shellcheck disable=SC2016
+if [ "$do_ephemeral" = "1" ]; then
+    echo ""
+    echo "[ephemeral] \$HOME is tmpfs; --seed copies in; --persist survives."
+
+    # Default $HOME is a fresh tmpfs every run — a marker written in one
+    # run must not be visible in the next.
+    in_sb_none /bin/sh -c 'echo x > "$HOME/.basta-eph-canary"' >/dev/null 2>&1
+    probe FAIL "BLOCKED \$HOME marker survives across runs" \
+        in_sb_none /bin/cat "$HOME/.basta-eph-canary"
+
+    # --seed: a host file is copied into the sandbox $HOME, readable.
+    seeddir=$(mktemp -d)
+    echo basta-seed-content > "$seeddir/probe.txt"
+    probe PASS "ALLOWED --seed file readable in sandbox" \
+        "$BASTA" --net none --seed "$seeddir/probe.txt:.basta-seed-probe" /tmp \
+        -- /bin/cat "$HOME/.basta-seed-probe"
+    # --seed is a copy-in: writing it inside the sandbox must NOT reach
+    # the host source file.
+    "$BASTA" --net none --seed "$seeddir/probe.txt:.basta-seed-probe" /tmp \
+        -- /bin/sh -c 'echo MUTATED > "$HOME/.basta-seed-probe"' >/dev/null 2>&1
+    if grep -qx basta-seed-content "$seeddir/probe.txt"; then
+        echo "  ok      --seed SRC on host unchanged after in-sandbox write"
+    else
+        echo "  FAIL    --seed write leaked to host SRC"; fails=$((fails+1))
+    fi
+    # --seed of a directory copies the whole tree.
+    mkdir -p "$seeddir/tree/sub"
+    echo nested > "$seeddir/tree/sub/file"
+    probe PASS "ALLOWED --seed dir tree readable in sandbox" \
+        "$BASTA" --net none --seed "$seeddir/tree:.basta-seed-tree" /tmp \
+        -- /bin/cat "$HOME/.basta-seed-tree/sub/file"
+    rm -rf "$seeddir"
+
+    # --persist: a RW bind that survives across runs.
+    persistdir=$(mktemp -d)
+    "$BASTA" --net none --persist "$persistdir:.basta-persist-probe" /tmp \
+        -- /bin/sh -c 'echo kept > "$HOME/.basta-persist-probe/marker"' >/dev/null 2>&1
+    probe PASS "ALLOWED --persist marker survives across runs" \
+        "$BASTA" --net none --persist "$persistdir:.basta-persist-probe" /tmp \
+        -- /bin/cat "$HOME/.basta-persist-probe/marker"
+    # --persist creates a missing SRC directory on first use.
+    persist_new="$persistdir/made-by-basta"
+    "$BASTA" --net none --persist "$persist_new:.basta-persist-new" /tmp \
+        -- /bin/true >/dev/null 2>&1
+    check "--persist creates missing SRC dir" test -d "$persist_new"
+    rm -rf "$persistdir"
+fi
+
+# --- namespaces ---
+if [ "$do_namespaces" = "1" ]; then
+    echo ""
+    echo "[namespaces] sandbox in its own user/net/pid/cgroup."
+
+    # PID namespace — count PIDs visible in /proc. Fresh pidns has very
+    # few (just bwrap PID 1, the agent, maybe a reaper).
+    pid_count=$(in_sb_none /bin/sh -c "ls /proc | grep -c '^[0-9]'" 2>/dev/null | tr -d '[:space:]')
+    if [ -n "$pid_count" ] && [ "$pid_count" -le 10 ]; then
+        echo "  ok      sandbox in fresh pidns ($pid_count PIDs visible)"
+    else
+        echo "  FAIL    pidns leak — $pid_count PIDs visible"
+        fails=$((fails+1))
+    fi
+
+    probe FAIL "BLOCKED /sys/fs/cgroup list" in_sb_none /bin/ls /sys/fs/cgroup
+    probe FAIL "BLOCKED mount -t cgroup2"    in_sb_none /bin/sh -c "mkdir -p /tmp/cg && mount -t cgroup2 none /tmp/cg"
+fi
+
+# --- agent seccomp denylist ---
+# SC2016: single-quoted $-strings in sandbox commands resolve in the
+# sandbox, not here — intentional.
+# shellcheck disable=SC2016
+if [ "$do_seccomp" = "1" ]; then
+    echo ""
+    echo "[seccomp] agent denylist: dangerous syscalls EPERM'd; dev intact."
+
+    # Filter installed — Seccomp: 2 == SECCOMP_MODE_FILTER.
+    probe PASS "agent seccomp filter active (offline)" \
+        in_sb_none /bin/sh -c 'grep -q "^Seccomp:[[:space:]]*2" /proc/self/status'
+    if "$BASTA" --allow "$PROBE_HOST_IP:443" /tmp -- /bin/true >/dev/null 2>&1; then
+        probe PASS "agent seccomp filter active (egress)" \
+            "$BASTA" --allow "$PROBE_HOST_IP:443" /tmp -- \
+            /bin/sh -c 'grep -q "^Seccomp:[[:space:]]*2" /proc/self/status'
+    fi
+
+    # A default-denied syscall fails with EPERM (io_uring_setup, nr 425).
+    probe FAIL "BLOCKED io_uring_setup (denylist -> EPERM)" \
+        in_sb_none /usr/bin/python3 -c '
+import ctypes
+libc = ctypes.CDLL("libc.so.6", use_errno=True)
+libc.syscall.restype = ctypes.c_long
+r = libc.syscall(425, 8, ctypes.c_void_p(0))
+raise SystemExit(0 if r >= 0 else 1)'
+
+    # H1: unshare is denylisted -> EPERM (else CLONE_NEWUSER succeeds).
+    probe FAIL "BLOCKED unshare(CLONE_NEWUSER) (denylist -> EPERM)" \
+        in_sb_none /usr/bin/python3 -c '
+import ctypes
+libc = ctypes.CDLL("libc.so.6", use_errno=True)
+raise SystemExit(0 if libc.unshare(0x10000000) == 0 else 1)'
+
+    # H3: name_to_handle_at is denylisted -> EPERM (errno 1). With bad
+    # args a reachable syscall returns EFAULT (14) instead.
+    probe FAIL "BLOCKED name_to_handle_at (denylist -> EPERM)" \
+        in_sb_none /usr/bin/python3 -c '
+import ctypes
+libc = ctypes.CDLL("libc.so.6", use_errno=True)
+libc.syscall.restype = ctypes.c_long
+libc.syscall(303, 0, 0, 0, 0, 0)
+raise SystemExit(1 if ctypes.get_errno() == 1 else 0)'
+
+    # 32-bit (i386-ABI) syscalls must be KILLED by the filter's arch-
+    # validation prologue. A normal 64-bit binary issuing `int $0x80`
+    # enters the i386 syscall path; seccomp sees a foreign arch and the
+    # process dies (SIGSYS). The unfiltered run is the control: it both
+    # proves the host supports IA32 emulation and shows the binary exits
+    # 0 when not filtered — so a non-zero filtered rc is the kill.
+    sc_cc=$(command -v cc || command -v gcc || true)
+    if [ -n "$sc_cc" ]; then
+        sc_dir=$(mktemp -d)
+        cat > "$sc_dir/i386abi.c" <<'EOF'
+int main(void){
+    long r;
+    __asm__ volatile("int $0x80" : "=a"(r) : "a"(20) : "memory","cc");
+    return (int)(r < 0);
+}
+EOF
+        if "$sc_cc" -O0 -o "$sc_dir/i386abi" "$sc_dir/i386abi.c" 2>/dev/null; then
+            set +e
+            "$BASTA" --no-seccomp /tmp "$sc_dir:ro" -- "$sc_dir/i386abi" >/dev/null 2>&1
+            sc_baseline=$?
+            "$BASTA" --net none /tmp "$sc_dir:ro" -- "$sc_dir/i386abi" >/dev/null 2>&1
+            sc_filtered=$?
+            set -e
+            if [ "$sc_baseline" -eq 0 ]; then
+                if [ "$sc_filtered" -ne 0 ]; then
+                    echo "  ok      KILLED i386-ABI syscall under filter (rc=$sc_filtered, unfiltered rc=0)"
+                else
+                    echo "  FAIL    i386-ABI syscall NOT killed (filtered rc=0)"
+                    fails=$((fails+1))
+                fi
+            else
+                echo "  ok      32-bit-kill probe skipped (host lacks IA32 emulation)"
+            fi
+        else
+            echo "  ok      32-bit-kill probe skipped (C compile failed)"
+        fi
+        rm -rf "$sc_dir"
+    else
+        echo "  ok      32-bit-kill probe skipped (no C compiler)"
+    fi
+
+    # Dev syscalls must stay intact (guard against an over-broad filter).
+    # ptrace of a self-spawned child — meaningful only where Yama permits
+    # it; deny it via --deny-syscall and confirm the toggle bites.
+    sc_scope=$(cat /proc/sys/kernel/yama/ptrace_scope 2>/dev/null || echo 0)
+    if [ "$sc_scope" -le 1 ]; then
+        probe PASS "ALLOWED ptrace of own child (dev syscalls intact)" \
+            in_sb_none /usr/bin/python3 -c '
+import ctypes, os, time, signal
+libc = ctypes.CDLL("libc.so.6", use_errno=True)
+libc.ptrace.restype = ctypes.c_long
+libc.ptrace.argtypes = [ctypes.c_long]*4
+c = os.fork()
+if c == 0:
+    time.sleep(5); os._exit(0)
+time.sleep(0.3)
+r = libc.ptrace(16, c, 0, 0)
+if r == 0: libc.ptrace(17, c, 0, 0)
+os.kill(c, signal.SIGKILL); os.waitpid(c, 0)
+raise SystemExit(0 if r == 0 else 1)'
+        probe FAIL "BLOCKED ptrace after --deny-syscall ptrace" \
+            "$BASTA" --deny-syscall ptrace /tmp -- /usr/bin/python3 -c '
+import ctypes, os, time, signal
+libc = ctypes.CDLL("libc.so.6", use_errno=True)
+libc.ptrace.restype = ctypes.c_long
+libc.ptrace.argtypes = [ctypes.c_long]*4
+c = os.fork()
+if c == 0:
+    time.sleep(5); os._exit(0)
+time.sleep(0.3)
+r = libc.ptrace(16, c, 0, 0)
+if r == 0: libc.ptrace(17, c, 0, 0)
+os.kill(c, signal.SIGKILL); os.waitpid(c, 0)
+raise SystemExit(0 if r == 0 else 1)'
+    else
+        echo "  ok      ptrace probes skipped (host yama.ptrace_scope=$sc_scope)"
+    fi
+
+    # --no-seccomp turns the filter off entirely.
+    probe PASS "--no-seccomp disables the filter (Seccomp: 0)" \
+        "$BASTA" --no-seccomp /tmp -- \
+        /bin/sh -c 'grep -q "^Seccomp:[[:space:]]*0" /proc/self/status'
+
+    # --allow-syscall un-blocks a default-denied syscall (EPERM -> not).
+    probe PASS "--allow-syscall io_uring_setup un-blocks it" \
+        "$BASTA" --allow-syscall io_uring_setup /tmp -- /usr/bin/python3 -c '
+import ctypes
+libc = ctypes.CDLL("libc.so.6", use_errno=True)
+libc.syscall.restype = ctypes.c_long
+r = libc.syscall(425, 8, ctypes.c_void_p(0))
+raise SystemExit(0 if (r >= 0 or ctypes.get_errno() != 1) else 1)'
+
+    # An unknown syscall name is a hard preflight error.
+    probe FAIL "BLOCKED unknown --deny-syscall name (preflight error)" \
+        "$BASTA" --deny-syscall not_a_syscall /tmp -- /bin/true
+
+    # F5 advisory: host Yama ptrace_scope should be restricted.
+    if [ "$sc_scope" -ge 1 ]; then
+        echo "  ok      host yama.ptrace_scope=$sc_scope (intra-sandbox ptrace restricted)"
+    else
+        echo "  ok      host yama.ptrace_scope=0 (advisory: 1+ recommended)"
+    fi
+fi
+
+# --- gpu absent ---
+if [ "$do_gpu_absent" = "1" ]; then
+    echo ""
+    echo "[gpu] by default (GPU off), /dev/nvidia* absent."
+    probe FAIL "BLOCKED /dev/nvidia0"   in_sb_none /bin/ls /dev/nvidia0
+    probe FAIL "BLOCKED nvidia-smi"     in_sb_none /bin/sh -c "command -v nvidia-smi >/dev/null && nvidia-smi"
+fi
+
+# --- gpu present ---
+if [ "$do_gpu_present" = "1" ]; then
+    echo ""
+    echo "[gpu] with --gpu, nvidia-smi works."
+    probe PASS "ALLOWED nvidia-smi (--gpu)" "$BASTA" --net none --gpu /tmp -- /bin/sh -c "nvidia-smi >/dev/null"
+fi
+
+# --- audit replay ---
+if [ "$do_audit" = "1" ]; then
+    echo ""
+    echo "[audit] replay of proc/netns findings."
+    # F8/F14: /proc/1/cmdline + task/1/cmdline null-bound.
+    probe FAIL "BLOCKED /proc/1/cmdline (F8)" \
+        in_sb_none /bin/sh -c "test -s /proc/1/cmdline"
+    probe FAIL "BLOCKED /proc/1/task/1/cmdline (F14)" \
+        in_sb_none /bin/sh -c "test -s /proc/1/task/1/cmdline"
+    # F9: setuid binaries cannot elevate. The sandbox sets no_new_privs, so the
+    # kernel ignores setuid bits on execve — sudo/su/pkexec run as the
+    # unprivileged agent and cannot become root. NNP is the real boundary (we no
+    # longer null-bind sudo, which was cosmetic, incomplete, and non-portable).
+    probe PASS "no_new_privs=1 (setuid binaries inert, F9)" \
+        in_sb_none /bin/sh -c "grep -Eq 'NoNewPrivs:[[:space:]]+1' /proc/self/status"
+    probe FAIL "BLOCKED sudo elevation (F9)" \
+        in_sb_none /bin/sh -c "command -v sudo >/dev/null && sudo -n true"
+    # F15: /dev/tty + /dev/console null-bound.
+    probe FAIL "BLOCKED escape to host pty via /dev/console (F15)" \
+        in_sb_none /bin/sh -c "echo X > /dev/console"
+    # F16: /proc/1/fd/{0,1,2} point at sandbox pty, not host.
+    inside_pts=$(in_sb_none /bin/sh -c "readlink /proc/1/fd/1" 2>/dev/null | tr -d '[:space:]')
+    host_pts=$(readlink /proc/self/fd/1 2>/dev/null | tr -d '[:space:]')
+    if [ "$inside_pts" != "$host_pts" ]; then
+        echo "  ok      /proc/1/fd/1 isolated from host pty (F16): in=$inside_pts host=$host_pts"
+    else
+        echo "  FAIL    /proc/1/fd/1 leaks host pty (F16)"; fails=$((fails+1))
+    fi
+    # F17/F18: even with pasta-supplied egress the sandbox netns cannot
+    # reach the host loopback or host abstract Unix sockets. Guard on the
+    # egress baseline so a launch failure isn't mistaken for "denied".
+    if "$BASTA" --allow "$PROBE_HOST_IP:443" /tmp -- /bin/true >/dev/null 2>&1; then
+        # F17: host loopback services unreachable from the sandbox netns.
+        probe FAIL "BLOCKED 127.0.0.1:22 from sandbox (F17)" \
+            "$BASTA" --allow "$PROBE_HOST_IP:443" /tmp -- \
+            /bin/bash -c 'exec 3<>/dev/tcp/127.0.0.1/22'
+        # F18: abstract Unix sockets unreachable across netns.
+        probe FAIL "BLOCKED abstract socket connect (F18)" \
+            "$BASTA" --allow "$PROBE_HOST_IP:443" /tmp -- \
+            /usr/bin/python3 -c "
+import socket
+s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM); s.settimeout(0.3)
+s.connect(b'\\0/org/kernel/linux/storage/multipathd')"
+    else
+        echo "  FAIL    basta --allow baseline launch failed; F17/F18 not tested"
+        egress_baseline_hint
+        fails=$((fails+1))
+    fi
+
+    # F17 opt-in: --allow-loopback PORT reaches that host loopback port; a
+    # different port stays blocked (pasta's -T list gates per-port).
+    ah_port=49231
+    python3 -m http.server "$ah_port" --bind 127.0.0.1 >/dev/null 2>&1 &
+    ah_pid=$!
+    sleep 0.5
+    probe PASS "ALLOWED host 127.0.0.1:$ah_port via --allow-loopback" \
+        "$BASTA" --allow-loopback "$ah_port" /tmp -- \
+        /usr/bin/curl -sS --max-time 5 -o /dev/null "http://127.0.0.1:$ah_port/"
+    probe FAIL "BLOCKED host 127.0.0.1:$ah_port for a non-listed port (F17)" \
+        "$BASTA" --allow-loopback 1 /tmp -- \
+        /usr/bin/curl -sS --max-time 5 -o /dev/null "http://127.0.0.1:$ah_port/"
+    kill "$ah_pid" 2>/dev/null || true
+    wait "$ah_pid" 2>/dev/null || true
+fi
+
+echo ""
+if [ "$fails" -eq 0 ]; then
+    echo "=== ALL PROBES PASSED ==="
+    exit 0
+else
+    echo "=== ${fails} PROBE(S) FAILED ==="
+    exit 1
+fi

@@ -1,0 +1,239 @@
+#!/bin/bash
+# basta-host-setup — one-time host configuration for basta (idempotent).
+#
+# basta egress is rootless and per-launch: no bridge, no dnsmasq, no host
+# nftables table, no sudoers drop-in, no systemd unit, no /etc/basta, no
+# POSIX group. This script only installs runtime dependencies and, on
+# kernels that gate it, the AppArmor profiles that let basta and bwrap
+# create unprivileged user namespaces. Self-elevates with sudo when not
+# already root — invoke as your user; the script prompts for the password.
+#
+# Steps (default install path):
+#   1. Install bubblewrap, nftables, passt via the system package manager
+#      (apt / dnf / pacman / zypper / apk — auto-detected; package names are
+#      the same across distros).
+#   2. Unprivileged user-namespace gate. On Ubuntu/Debian with AppArmor
+#      (apparmor_restrict_unprivileged_userns=1) install /etc/apparmor.d/
+#      {basta,bwrap} and reload them (--no-apparmor instead clears the sysctl,
+#      less preferred). On Debian (unprivileged_userns_clone) or RHEL/Fedora
+#      (user.max_user_namespaces) enable the knob if it is off; SELinux distros
+#      need no profile. A final probe confirms userns actually works.
+#
+# --uninstall path: unload + remove /etc/apparmor.d/{basta,bwrap} and the
+# --no-apparmor drop-in. Called by `make uninstall`.
+#
+# Re-run safely at any time.
+#
+# Usage:
+#   basta-host-setup              # install (default)
+#   basta-host-setup --uninstall  # tear down
+#   basta-host-setup --no-apparmor
+#   basta-host-setup --dry-run
+#
+# Flags:
+#   --uninstall     Tear down host state and exit. Called by `make uninstall`.
+#   --no-apparmor   Clear kernel.apparmor_restrict_unprivileged_userns
+#                   instead of installing the profiles.
+#   --dry-run       Print commands instead of running them.
+#   -h, --help      Show this help.
+
+set -e
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
+APPARMOR_BWRAP="${SCRIPT_DIR}/share/apparmor.bwrap"
+APPARMOR_BASTA="${SCRIPT_DIR}/share/apparmor.basta"
+
+# Find the AppArmor profile sources. Try (in order):
+#   $SCRIPT_DIR/share/                 running from the repo
+#   $XDG_DATA_HOME/basta/                user install (XDG)
+#   $HOME/.local/share/basta/            user install (XDG fallback)
+#   /usr/local/share/basta/, /usr/share/basta/  system installs
+# Under sudo, $HOME is root's — resolve the calling user via $SUDO_USER.
+call_home="${HOME}"
+if [ -n "${SUDO_USER:-}" ] && [ "$(id -u)" = "0" ]; then
+    call_home=$(getent passwd "$SUDO_USER" | cut -d: -f6)
+fi
+xdg_data_home="${XDG_DATA_HOME:-$call_home/.local/share}"
+
+if [ ! -f "$APPARMOR_BASTA" ]; then
+    for d in "$xdg_data_home/basta" "$call_home/.local/share/basta" /usr/local/share/basta /usr/share/basta; do
+        if [ -f "$d/apparmor.basta" ]; then
+            APPARMOR_BWRAP="$d/apparmor.bwrap"
+            APPARMOR_BASTA="$d/apparmor.basta"
+            break
+        fi
+    done
+fi
+
+no_apparmor=0
+do_uninstall=0
+DRY_RUN="${DRY_RUN:-0}"
+
+print_help() {
+    sed -n '2,/^set -e$/{/^set -e$/q;p;}' "$0" | sed 's/^# \?//'
+}
+
+die() {
+    echo "ERROR: $*" >&2
+    exit 1
+}
+
+run() {
+    echo "+ $*"
+    [ "$DRY_RUN" = "1" ] && return 0
+    "$@"
+}
+
+# First supported package manager on PATH. basta's three deps (bubblewrap,
+# nftables, passt) share the same package names across all of these.
+detect_pm() {
+    for pm in apt-get dnf pacman zypper apk; do
+        command -v "$pm" >/dev/null 2>&1 && { echo "$pm"; return; }
+    done
+    echo unknown
+}
+
+install_pkgs() {  # $@ = package names
+    case "$PM" in
+        apt-get) run apt-get update; run apt-get install -y "$@" ;;
+        dnf)     run dnf install -y "$@" ;;
+        pacman)  run pacman -Sy --needed --noconfirm "$@" ;;
+        zypper)  run zypper --non-interactive install "$@" ;;
+        apk)     run apk add "$@" ;;
+        *)       die "no supported package manager found (need: $*)" ;;
+    esac
+}
+
+while [ $# -gt 0 ]; do
+    case "$1" in
+        --no-apparmor)  no_apparmor=1; shift ;;
+        --uninstall)    do_uninstall=1; shift ;;
+        --dry-run)      DRY_RUN=1; shift ;;
+        -h|--help)      print_help; exit 0 ;;
+        *)              die "unknown option: $1" ;;
+    esac
+done
+
+# Re-exec under sudo if not root. Rebuild the flag list from parsed state.
+if [ "$(id -u)" != "0" ] && [ "$DRY_RUN" != "1" ]; then
+    echo "basta-host-setup needs root — re-running under sudo." >&2
+    reexec_args=()
+    [ "$no_apparmor" = "1" ] && reexec_args+=(--no-apparmor)
+    [ "$do_uninstall" = "1" ] && reexec_args+=(--uninstall)
+    exec sudo "$0" "${reexec_args[@]}"
+fi
+
+# --uninstall: tear down host state and exit. Pair of `make uninstall`.
+if [ "$do_uninstall" = "1" ]; then
+    echo "=== basta-host-setup --uninstall ==="
+    echo ""
+    # AppArmor profiles installed by the default install path.
+    run apparmor_parser -R /etc/apparmor.d/basta 2>/dev/null || true
+    run apparmor_parser -R /etc/apparmor.d/bwrap 2>/dev/null || true
+    run rm -f /etc/apparmor.d/basta /etc/apparmor.d/bwrap /etc/sysctl.d/60-basta.conf
+    echo ""
+    echo "=== host state removed ==="
+    exit 0
+fi
+
+echo "=== basta-host-setup ==="
+echo ""
+
+# --- Step 1: packages ---
+echo "Step 1: packages"
+PM=$(detect_pm)
+# bubblewrap (the sandbox) and nftables (the egress filter ruleset) are
+# required. passt/pasta is needed ONLY for filtered egress (--allow*); offline
+# sandboxing works without it, and some LTS repos (notably Ubuntu 22.04) don't
+# package it. So passt is best-effort: install if available, warn if not.
+req_missing=()
+command -v bwrap >/dev/null 2>&1 || req_missing+=(bubblewrap)
+command -v nft   >/dev/null 2>&1 || req_missing+=(nftables)
+if [ ${#req_missing[@]} -eq 0 ]; then
+    echo "  ✓ bubblewrap, nftables already installed"
+elif [ "$PM" = "unknown" ]; then
+    die "missing: ${req_missing[*]} — and no supported package manager found (apt/dnf/pacman/zypper/apk). Install bubblewrap and nftables manually."
+else
+    echo "  using $PM to install: ${req_missing[*]}"
+    install_pkgs "${req_missing[@]}"
+fi
+if command -v pasta >/dev/null 2>&1; then
+    echo "  ✓ passt (pasta) present — filtered egress available"
+elif [ "$PM" != "unknown" ] && install_pkgs passt >/dev/null 2>&1; then
+    echo "  ✓ passt installed — filtered egress available"
+else
+    echo "  WARN: passt/pasta not available from the package manager — filtered"
+    echo "        egress (--allow / --allow-sni / --allow-loopback) will not work."
+    echo "        Offline sandboxing is unaffected. Install 'passt' from backports"
+    echo "        or source to enable egress."
+fi
+
+# --- Step 2: unprivileged user-namespace gate ---
+echo ""
+echo "Step 2: unprivileged user-namespace gate"
+if [ -e /proc/sys/kernel/apparmor_restrict_unprivileged_userns ]; then
+    # Ubuntu 23.10+/Debian with AppArmor: userns is gated unless the binary
+    # carries an AppArmor profile granting `userns`.
+    val=$(cat /proc/sys/kernel/apparmor_restrict_unprivileged_userns)
+    if [ "$val" = "1" ]; then
+        if [ "$no_apparmor" = "1" ]; then
+            run sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
+            grep -q '^kernel.apparmor_restrict_unprivileged_userns' \
+                /etc/sysctl.d/60-basta.conf 2>/dev/null || \
+                run bash -c 'echo "kernel.apparmor_restrict_unprivileged_userns=0" > /etc/sysctl.d/60-basta.conf'
+        else
+            command -v apparmor_parser >/dev/null 2>&1 || \
+                die "apparmor_parser not found, but apparmor_restrict_unprivileged_userns=1. Install apparmor-utils or use --no-apparmor."
+            [ -f "$APPARMOR_BWRAP" ] || die "apparmor.bwrap not found at $APPARMOR_BWRAP"
+            [ -f "$APPARMOR_BASTA" ]   || die "apparmor.basta not found at $APPARMOR_BASTA"
+            # bwrap profile: lets bwrap create the sandbox's nested userns.
+            run install -m 0644 "$APPARMOR_BWRAP" /etc/apparmor.d/bwrap
+            run apparmor_parser -r /etc/apparmor.d/bwrap
+            # basta profile: lets the launcher unshare user+net before exec.
+            run install -m 0644 "$APPARMOR_BASTA" /etc/apparmor.d/basta
+            run apparmor_parser -r /etc/apparmor.d/basta
+        fi
+    else
+        echo "  ✓ apparmor_restrict_unprivileged_userns=$val — no profile needed"
+    fi
+elif [ -e /proc/sys/kernel/unprivileged_userns_clone ]; then
+    # Debian downstream knob — all-or-nothing, no AppArmor profile concept.
+    val=$(cat /proc/sys/kernel/unprivileged_userns_clone)
+    if [ "$val" = "1" ]; then
+        echo "  ✓ unprivileged_userns_clone=1 — no profile needed"
+    else
+        run sysctl -w kernel.unprivileged_userns_clone=1
+        run bash -c 'echo "kernel.unprivileged_userns_clone=1" > /etc/sysctl.d/60-basta.conf'
+    fi
+elif [ -e /proc/sys/user/max_user_namespaces ]; then
+    # RHEL/Fedora/upstream. SELinux does NOT gate userns the way Ubuntu's
+    # AppArmor does — no basta profile is needed here.
+    val=$(cat /proc/sys/user/max_user_namespaces)
+    if [ "$val" -ge 1 ] 2>/dev/null; then
+        echo "  ✓ user.max_user_namespaces=$val (SELinux needs no basta profile)"
+    else
+        run sysctl -w user.max_user_namespaces=15000
+        run bash -c 'echo "user.max_user_namespaces=15000" > /etc/sysctl.d/60-basta.conf'
+    fi
+else
+    echo "  ✓ kernel does not gate unprivileged user namespaces"
+fi
+
+# Final capability probe (all distros) — a clean userns is the real requirement.
+if [ "$DRY_RUN" != "1" ]; then
+    if unshare --user --map-root-user true 2>/dev/null; then
+        echo "  ✓ unprivileged user namespaces work"
+    else
+        echo "  WARN: unprivileged user namespaces are still blocked — basta will not run."
+        echo "        Check for a hardened kernel (e.g. Arch linux-hardened), container"
+        echo "        limits, or a site policy disabling userns."
+    fi
+fi
+
+echo ""
+echo "=== Setup complete ==="
+echo ""
+echo "Verify:  basta-verify"
+echo "Launch:  basta -- <command>"
+echo "         basta --allow api.example.com:443 -- <command>"

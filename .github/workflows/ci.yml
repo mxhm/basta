@@ -1,0 +1,120 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+    tags: ['v*']
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    name: fmt + clippy + test (musl)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - name: Toolchain
+        run: |
+          rustup component add clippy rustfmt
+          rustup target add x86_64-unknown-linux-musl
+          sudo apt-get update && sudo apt-get install -y musl-tools
+      - name: Format
+        run: cargo fmt -- --check
+      # Lint and test against the musl target that ships, not the glibc host —
+      # libc constants / seccompiler behaviour can differ between the two.
+      - name: Clippy
+        run: cargo clippy --locked --target x86_64-unknown-linux-musl -- -D warnings
+      - name: Test
+        run: cargo test --locked --target x86_64-unknown-linux-musl
+
+  build-musl:
+    name: build (static musl)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - name: musl toolchain
+        run: |
+          rustup target add x86_64-unknown-linux-musl
+          sudo apt-get update && sudo apt-get install -y musl-tools
+      - name: Build
+        run: cargo build --locked --release --target x86_64-unknown-linux-musl
+      # The runnable bundle: the binary plus the host-setup/verify scripts and
+      # the AppArmor profiles they install.
+      - uses: actions/upload-artifact@v5
+        with:
+          name: basta-x86_64-unknown-linux-musl
+          path: |
+            target/x86_64-unknown-linux-musl/release/basta
+            basta-host-setup
+            basta-verify
+            share/apparmor.basta
+            share/apparmor.bwrap
+
+  shellcheck:
+    name: shellcheck
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - name: shellcheck
+        run: |
+          sudo apt-get update && sudo apt-get install -y shellcheck
+          # --severity=warning: the two SC2016 infos are intentional (deferred
+          # expansion inside `bash -c` strings).
+          shellcheck --severity=warning basta-host-setup basta-verify
+
+  # On a v* tag (and only if the checks above pass), build a static binary,
+  # bundle it with the scripts + AppArmor profiles + license/changelog into a
+  # checksummed tarball, and publish a GitHub Release. Uses the built-in
+  # GITHUB_TOKEN (no PAT) — needs only contents:write on this job.
+  release:
+    name: release (tag)
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: [test, build-musl, shellcheck]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v5
+      - name: musl toolchain
+        run: |
+          rustup target add x86_64-unknown-linux-musl
+          sudo apt-get update && sudo apt-get install -y musl-tools
+      - name: Build
+        run: cargo build --locked --release --target x86_64-unknown-linux-musl
+      - name: Package
+        run: |
+          dir="basta-${GITHUB_REF_NAME}-x86_64-linux-musl"
+          mkdir "$dir"
+          cp target/x86_64-unknown-linux-musl/release/basta basta-host-setup basta-verify "$dir"/
+          cp -r share "$dir"/share
+          mkdir "$dir"/docs && cp docs/agent-recipes.md "$dir"/docs/
+          cp README.md CHANGELOG.md SECURITY.md CONTRIBUTING.md LICENSE-MIT THIRD-PARTY-LICENSES "$dir"/
+          # Stable, version-less asset name so the latest-release download URL
+          # (releases/latest/download/basta-x86_64-linux-musl.tar.gz) is permanent;
+          # the version lives in the inner dir name and CHANGELOG.
+          tar czf basta-x86_64-linux-musl.tar.gz "$dir"
+          sha256sum basta-x86_64-linux-musl.tar.gz > basta-x86_64-linux-musl.tar.gz.sha256
+      - name: Publish release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          # Idempotent: a re-tag (force-moved v* tag) re-runs this job; create
+          # the release the first time, otherwise refresh its assets + notes so
+          # the published tarball always matches the tagged commit.
+          notes="Static x86_64 musl build. See [CHANGELOG.md](https://github.com/${GITHUB_REPOSITORY}/blob/${GITHUB_REF_NAME}/CHANGELOG.md)."
+          if gh release view "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            gh release upload "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" --clobber \
+              basta-x86_64-linux-musl.tar.gz basta-x86_64-linux-musl.tar.gz.sha256
+            gh release edit "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" \
+              --title "basta $GITHUB_REF_NAME" --notes "$notes"
+          else
+            gh release create "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" \
+              --title "basta $GITHUB_REF_NAME" --notes "$notes" \
+              basta-x86_64-linux-musl.tar.gz basta-x86_64-linux-musl.tar.gz.sha256
+          fi
+
+# Note: basta-verify (the end-to-end sandbox/egress/seccomp probes) needs working
+# unprivileged user namespaces + bwrap and is run manually / on the VM QC matrix,
+# not in CI.

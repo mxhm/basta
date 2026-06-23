@@ -1,0 +1,28 @@
+[package]
+name = "basta"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.85"
+description = "Bubblewrap-based sandbox launcher for coding agents"
+license = "MIT"
+repository = "https://github.com/mxhm/basta"
+
+[[bin]]
+name = "basta"
+path = "src/main.rs"
+
+[dependencies]
+anyhow = "1"
+clap = { version = "4", features = ["derive", "wrap_help"] }
+nix = { version = "0.30", features = [
+    "fs", "process", "sched", "term", "user", "poll", "mman", "socket", "net"
+] }
+libc = "0.2"
+seccompiler = "0.5"
+signal-hook = "0.3"
+
+[profile.release]
+strip = "symbols"
+lto = "fat"
+codegen-units = 1
+panic = "abort"

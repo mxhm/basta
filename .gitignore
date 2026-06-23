@@ -1,0 +1,25 @@
+# Planning, research, and audit notes — kept local, never committed.
+# Both folders may contain an archive/ subfolder for superseded docs.
+plans/
+research/
+
+# Cargo build artifacts
+/target
+**/*.rs.bk
+
+# cargo-fuzz generated artifacts (the harness itself is tracked)
+/fuzz/target
+/fuzz/corpus
+/fuzz/artifacts
+/fuzz/Cargo.lock
+
+# Editor / OS cruft
+.DS_Store
+*.swp
+*.swo
+*~
+.vscode/
+.idea/
+
+# bats helpers (if vendored)
+tests/bats-*/
