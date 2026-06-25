@@ -254,7 +254,10 @@ If the agent blocks on a host or path it needs, add `--allow <host>` (or a
 
 The `--network`, `--sni`, and `--audit` probes reach the public internet;
 override the targets with `BASTA_PROBE_HOST` / `BASTA_PROBE_HOST_IP` /
-`BASTA_PROBE_DNS` / `BASTA_PROBE_DNS_NAME`.
+`BASTA_PROBE_DNS` / `BASTA_PROBE_DNS_NAME`. basta-verify also skips probes whose
+prerequisites are absent (logged as `skipped`, never a silent pass), so a clean
+run on a bare host is not full coverage — the complete suite is meant to run on a
+known-good Linux image (see `research/vm-qc-harness.md`).
 
 `basta --build-rev` prints the git rev the binary was built from.
 
@@ -264,9 +267,17 @@ override the targets with `BASTA_PROBE_HOST` / `BASTA_PROBE_HOST_IP` /
   behave exactly as on the host. The agent has `no_new_privs` and no capabilities in an
   unprivileged user namespace, so setuid-root binaries (`sudo`, `su`, `pkexec`)
   run as the unprivileged agent and can't elevate.
-- In the bwrap mount namespace, only your explicit binds are visible; `$HOME` is
-  a fresh tmpfs, and the host's `/proc/1`, terminals, and `/sys/fs/cgroup` are
-  not.
+- In the bwrap mount namespace the host root is **not** visible, but three host
+  trees are always mounted **read-only** so the agent can run the host toolchain:
+  `/usr` (compilers, interpreters, the dynamic linker), `/etc`, and `/opt` if
+  present — plus the mise tool tree under `~/.local`. `$HOME` is a fresh tmpfs,
+  and the host's `/proc/1`, terminals, and `/sys/fs/cgroup` are not. `/etc` is
+  load-bearing (TLS CA bundles, `ld.so.cache`, the Debian `/etc/alternatives`
+  symlinks, NSS), but binding it whole also exposes world-readable host config —
+  `/etc/passwd` usernames, `/etc/os-release`, `/etc/hostname`. That is host
+  inventory, not your secrets (root-only files like `/etc/shadow` stay unreadable
+  — the agent runs as your unprivileged uid); treat it as an
+  information-disclosure surface, not a hermetic mount.
 - The egress filter runs in the sandbox's own network namespace, owned by an
   outer user namespace the agent can't reach, so it can't alter the filter. The
   SNI proxy self-sandboxes (seccomp, dropped capabilities). Services on the host
@@ -274,19 +285,25 @@ override the targets with `BASTA_PROBE_HOST` / `BASTA_PROBE_HOST_IP` /
 - The agent runs under a seccomp **denylist**: `io_uring`, kernel keyrings,
   `bpf`, `userfaultfd`, `mount`, `unshare`/`setns`, and module loading return
   `EPERM`, and 32-bit (i386-ABI) binaries are killed. Developer syscalls
-  (`ptrace`, `perf_event_open`) are kept. Tune with `--allow-syscall` /
+  (`ptrace`, `process_vm_readv`/`writev`, `perf_event_open`) are kept on by
+  default so debuggers/profilers/sanitizers work; they stay within the sandbox's
+  single uid and grant no access the agent doesn't already have over its own
+  processes and files. Drop them with `--deny-syscall ptrace process_vm_readv
+  process_vm_writev perf_event_open`. Tune further with `--allow-syscall` /
   `--deny-syscall`, or disable with `--no-seccomp`.
 - **Workspace lock** (on by default): in each writable workspace, the files a
   tool would run on its own are read-only: git internals (`.git/config`,
   `.git/hooks`, …), `.envrc`, `.vscode`, `.idea`, `.claude`, and `.mcp.json`. So
   the agent can't plant a git hook, a direnv script, or an editor/MCP config the
-  **host** would later run. Existing targets are locked read-only; open one
-  knowingly with `--unlock` (e.g. `--unlock .claude`), add paths with `--lock`,
-  or drop the set with `--no-lock`. A net-new file that didn't exist at launch
-  can't be pre-blocked, so basta watches the locked set and warns at exit if the
-  agent created one (`--lock-strict` makes that a non-zero exit). A locked target
-  that is a symlink can't be read-only-bound, so basta refuses to launch rather
-  than skip it.
+  **host** would later run. Existing targets are locked read-only — a hard block;
+  open one knowingly with `--unlock` (e.g. `--unlock .claude`), add paths with
+  `--lock`, or drop the set with `--no-lock`. A net-new autorun file the agent
+  creates *during* the run can't be pre-blocked (there's no source to bind), so
+  basta watches the locked set and warns at exit if one appeared — an **advisory**
+  post-hoc signal, not a hard block. `--lock-strict` turns that warning into a
+  non-zero exit; review flagged files before trusting the directory. A locked
+  target that is a symlink can't be read-only-bound, so basta refuses to launch
+  rather than skip it.
 - No privileged code path and no daemon; each launch leaves no host state behind
   except an opt-in `--persist`.
 

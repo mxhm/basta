@@ -2,6 +2,20 @@
 
 All notable changes to basta are documented here. Versions follow SemVer; basta is pre-1.0.
 
+## [0.1.1] — 2026-06
+
+- **AppArmor** — the `bwrap` profile attaches to every path `find_bin` resolves
+  bwrap from, not just `/usr/bin/bwrap`, so a non-standard bwrap install is not
+  left unconfined (which fails userns creation under the Ubuntu userns gate).
+- **basta-host-setup** — use `pacman -S` instead of `pacman -Sy` (partial-upgrade
+  hazard), with a hint to run `pacman -Syu` if a package is missing.
+- **basta-verify** — probe that the installed bwrap profile covers the resolved
+  bwrap path.
+- **Docs** — describe the always-read-only `/usr` and `/etc` host surface and what
+  `/etc` exposes; note `ptrace`/`perf_event_open` are kept by default and how to
+  drop them; note basta-verify is not hermetic; clarify the workspace-lock exit
+  warning is advisory.
+
 ## [0.1.0] — 2026-06
 
 First public release. A rootless Linux sandbox for running coding agents as your

@@ -98,7 +98,11 @@ install_pkgs() {  # $@ = package names
     case "$PM" in
         apt-get) run apt-get update; run apt-get install -y "$@" ;;
         dnf)     run dnf install -y "$@" ;;
-        pacman)  run pacman -Sy --needed --noconfirm "$@" ;;
+        pacman)  # No `-Sy`: refreshing the DB without a full upgrade is the Arch
+                 # partial-upgrade footgun. Install against the current DB; if a
+                 # package is missing, tell the user to sync first.
+                 run pacman -S --needed --noconfirm "$@" \
+                     || die "pacman install failed — run 'sudo pacman -Syu' to refresh the package database, then re-run basta-host-setup." ;;
         zypper)  run zypper --non-interactive install "$@" ;;
         apk)     run apk add "$@" ;;
         *)       die "no supported package manager found (need: $*)" ;;

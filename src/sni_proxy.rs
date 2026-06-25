@@ -165,11 +165,17 @@ fn open_ns(pid: i32, kind: &str) -> Result<OwnedFd> {
 }
 
 /// Self-sandbox the proxy AFTER startup (setns / route-check / bind done —
-/// nothing below needs the filesystem or a privileged syscall). This
-/// converts a hypothetical parser/dependency compromise from "code
-/// execution as the host user" into "a process confined to moving bytes
-/// between sockets it already holds." The only `unsafe` in this module is
-/// the localized raw-prctl code reached from here.
+/// nothing below needs the filesystem or a privileged syscall). This converts a
+/// hypothetical parser/dependency compromise from "code execution as the host
+/// user" into a process that keeps only CAP_NET_ADMIN (for per-connection
+/// SO_MARK), can open AF_INET sockets but NOT AF_NETLINK/AF_UNIX (seccomp pins
+/// socket() arg0), and cannot exec, touch the filesystem, or setns. It is NOT
+/// reduced to only its held fds — it can still connect outward — but every such
+/// connection carries SO_MARK and is therefore subject to the nftables egress
+/// ruleset, which is the actual gate. Blocking AF_NETLINK is what keeps
+/// CAP_NET_ADMIN safe: the proxy cannot open a netlink socket to reprogram the
+/// netns nft rules. The only `unsafe` in this module is the localized raw-prctl
+/// code reached from here.
 fn harden() -> Result<()> {
     set_no_new_privs().context("PR_SET_NO_NEW_PRIVS")?;
     set_undumpable().context("PR_SET_DUMPABLE 0")?;

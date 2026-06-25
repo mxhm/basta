@@ -155,6 +155,24 @@ if [ "$do_host" = "1" ]; then
         if [ "$basta_missing" = "1" ] || [ "$bwrap_missing" = "1" ]; then
             echo "  → run: basta-host-setup  (installs and loads the AppArmor profiles)"
         fi
+        # Drift guard: AppArmor confines by exec path, so the installed bwrap
+        # profile must attach to the dir find_bin (src/netns.rs) resolves bwrap
+        # from — else bwrap runs unconfined and userns creation fails (EPERM).
+        # The dir can appear either as a literal path (/usr/bin/bwrap) or as an
+        # element of the brace set (…,usr/bin,…}/bwrap), so accept both.
+        if [ "$bwrap_missing" = "0" ]; then
+            bwrap_dir=""
+            for d in /usr/sbin /sbin /usr/bin /bin /usr/local/sbin /usr/local/bin; do
+                if [ -x "$d/bwrap" ]; then bwrap_dir="${d#/}"; break; fi
+            done
+            if [ -n "$bwrap_dir" ]; then
+                check "AppArmor bwrap profile covers $bwrap_dir/bwrap" \
+                    bash -c 'd=$1; p=/etc/apparmor.d/bwrap;
+                        grep -q "/$d/bwrap" "$p" || grep -Eq "[{,]$d[,}]" "$p"' _ "$bwrap_dir"
+            else
+                echo "  ok      bwrap-profile-coverage probe skipped (bwrap not in a find_bin dir)"
+            fi
+        fi
     else
         # No AppArmor userns gate (Debian/RHEL/Fedora/etc.) — no basta profile is
         # needed, but the namespace must still actually work. Probe it.

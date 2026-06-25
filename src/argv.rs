@@ -28,7 +28,11 @@ pub fn build(
     push(&mut args, &["--die-with-parent", "--new-session"]);
     push(&mut args, &["--hostname", "basta"]);
 
-    // Read-only host mounts.
+    // Read-only host mounts. /etc is bound whole because it is load-bearing
+    // (TLS CA bundles, ld.so.cache, the Debian /etc/alternatives symlinks, NSS);
+    // this also exposes world-readable host config (e.g. /etc/passwd usernames)
+    // — a documented information-disclosure surface, not minimizable without a
+    // synthetic /etc. See README "Security model" + research/external-review-findings.md.
     push(&mut args, &["--ro-bind", "/usr", "/usr"]);
     push(&mut args, &["--ro-bind", "/etc", "/etc"]);
     // /opt is absent on minimal images (Alpine, slim Debian); bind only if present.
