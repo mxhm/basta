@@ -77,6 +77,11 @@ jobs:
       contents: write
     steps:
       - uses: actions/checkout@v5
+      - name: Tag matches Cargo.toml version
+        run: |
+          v=$(grep -m1 '^version' Cargo.toml | cut -d'"' -f2)
+          test "v$v" = "$GITHUB_REF_NAME" \
+            || { echo "::error::tag $GITHUB_REF_NAME != Cargo.toml v$v"; exit 1; }
       - name: musl toolchain
         run: |
           rustup target add x86_64-unknown-linux-musl
@@ -103,7 +108,20 @@ jobs:
           # Idempotent: a re-tag (force-moved v* tag) re-runs this job; create
           # the release the first time, otherwise refresh its assets + notes so
           # the published tarball always matches the tagged commit.
-          notes="Static x86_64 musl build. See [CHANGELOG.md](https://github.com/${GITHUB_REPOSITORY}/blob/${GITHUB_REF_NAME}/CHANGELOG.md)."
+          # Release notes = the CHANGELOG section for this version, plus a build
+          # footer. Falls back to the footer alone if no matching section.
+          ver="${GITHUB_REF_NAME#v}"
+          section=$(awk -v v="$ver" '
+            $0 ~ "^## \\[" v "\\]" {p=1; next}
+            p && /^## \[/ {exit}
+            p {print}
+          ' CHANGELOG.md | sed '/./,$!d')
+          footer="Static x86_64 musl build. See [CHANGELOG.md](https://github.com/${GITHUB_REPOSITORY}/blob/${GITHUB_REF_NAME}/CHANGELOG.md)."
+          if [ -n "$section" ]; then
+            notes=$(printf '%s\n\n%s\n' "$section" "$footer")
+          else
+            notes="$footer"
+          fi
           if gh release view "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
             gh release upload "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" --clobber \
               basta-x86_64-linux-musl.tar.gz basta-x86_64-linux-musl.tar.gz.sha256
