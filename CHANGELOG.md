@@ -4,6 +4,10 @@ All notable changes to basta are documented here. Versions follow SemVer; basta 
 
 ## [0.1.2] — 2026-07
 
+- **Workspaces** — a workspace at `$HOME` is refused: workspaces are bound last,
+  so it would mask the sandbox's own tmpfs `$HOME`. A read-write workspace
+  containing an earlier `:ro` one is refused too; `/tmp`, `/var/tmp` and `/run`
+  warn. `$HOME` itself is validated before it is used as a mount destination.
 - **`--publish PORT`** — forward host `127.0.0.1:PORT` into the sandbox so a host
   browser can reach a web UI served inside. One port, host loopback only; egress
   stays gated by `--allow*`. A published port is unauthenticated to every local

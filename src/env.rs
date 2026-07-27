@@ -2,9 +2,40 @@ use anyhow::{Result, bail};
 
 /// Resolve the caller's `$HOME`. Returns a normal error (not a panic) when it
 /// is unset or not valid UTF-8 — basta binds and `--setenv`s it as a string.
+///
+/// The value becomes a mount destination (`--tmpfs $HOME`, argv.rs) and the
+/// prefix for every seed/persist dest, so it is validated here rather than
+/// trusted: an empty, relative, or `..`-bearing HOME would place that tmpfs
+/// somewhere basta never intended, and a system directory would mask the
+/// read-only host tree the sandbox needs (`--tmpfs /usr` leaves nothing to
+/// exec). Not reachable from a normal login, but this is the one ambient
+/// value argv.rs mounts without any other guard.
 pub fn host_home() -> Result<String> {
-    std::env::var("HOME").map_err(|_| anyhow::anyhow!("$HOME is unset or not valid UTF-8"))
+    let home =
+        std::env::var("HOME").map_err(|_| anyhow::anyhow!("$HOME is unset or not valid UTF-8"))?;
+    let path = std::path::Path::new(&home);
+    if home.is_empty() || !path.is_absolute() {
+        bail!("$HOME must be an absolute path, got '{home}'");
+    }
+    if path
+        .components()
+        .any(|c| matches!(c, std::path::Component::ParentDir))
+    {
+        bail!("$HOME must not contain '..', got '{home}'");
+    }
+    if SYSTEM_DIRS.contains(&home.trim_end_matches('/')) {
+        bail!("$HOME is a system directory ('{home}') — refusing to mount over it");
+    }
+    Ok(home)
 }
+
+/// Directories basta must never mount over: they hold the read-only host
+/// tree the sandbox execs from, or the kernel filesystems it synthesises.
+/// Shared by `host_home` and the workspace-masking check.
+pub const SYSTEM_DIRS: &[&str] = &[
+    "", "/", "/etc", "/usr", "/var", "/sys", "/proc", "/boot", "/root", "/dev", "/bin", "/sbin",
+    "/lib", "/lib64", "/home",
+];
 
 /// Env keys basta sets itself in argv.rs. `--env` must not shadow them —
 /// a caller-supplied HOME/PATH/etc. would rewrite mount destinations or

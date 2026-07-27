@@ -80,6 +80,12 @@ fn run(cli: cli::Cli) -> Result<i32> {
             .collect::<Result<Vec<_>>>()?
     };
 
+    // Workspaces are emitted last in the bwrap argv, so one that covers a
+    // basta-managed mount would silently win over it. Checked before anything
+    // else uses them.
+    let home_path = std::path::PathBuf::from(env::host_home()?);
+    workspace::reject_masking(&workspaces, &home_path)?;
+
     let cwd = workspaces
         .iter()
         .find(|w| !w.ro)

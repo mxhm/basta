@@ -219,7 +219,10 @@ pub fn build(
                     .and_then(|rest| rest.chars().next())
                     .is_some_and(|c| c.is_ascii_digit());
                 if is_numbered {
-                    args.push("--dev-bind".into());
+                    // -try: the node is enumerated here but opened by bwrap a
+                    // moment later; a driver reload in between must not abort
+                    // the whole launch.
+                    args.push("--dev-bind-try".into());
                     args.push(format!("/dev/{name}"));
                     args.push(format!("/dev/{name}"));
                 }
@@ -389,7 +392,14 @@ const SAFE_SETENV: &[&str] = &[
 /// triples for caller-supplied env keys have their VALUE redacted so a
 /// secret passed via `--env` is never echoed to the terminal/logs.
 pub fn print(args: &[String]) {
-    eprint!("+ env -i bwrap --args FD");
+    eprintln!("{}", render(args));
+}
+
+/// Render the argv as one shell-ish line with caller `--env` values redacted.
+/// Split out of `print` so the redaction is assertable in a test.
+fn render(args: &[String]) -> String {
+    use std::fmt::Write as _;
+    let mut out = String::from("+ env -i bwrap --args FD");
     let mut i = 0;
     while i < args.len() {
         if args[i] == "--setenv" && i + 2 < args.len() {
@@ -399,14 +409,14 @@ pub fn print(args: &[String]) {
             } else {
                 "<redacted>".to_string()
             };
-            eprint!(" --setenv {} {}", shell_quote(key), shown);
+            let _ = write!(out, " --setenv {} {}", shell_quote(key), shown);
             i += 3;
         } else {
-            eprint!(" {}", shell_quote(&args[i]));
+            let _ = write!(out, " {}", shell_quote(&args[i]));
             i += 1;
         }
     }
-    eprintln!();
+    out
 }
 
 fn shell_quote(s: &str) -> String {
@@ -429,4 +439,323 @@ fn shell_quote(s: &str) -> String {
     }
     out.push('\'');
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::path::{Path, PathBuf};
+
+    fn scratch(tag: &str) -> PathBuf {
+        let p = std::env::temp_dir().join(format!("basta-argv-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&p);
+        std::fs::create_dir_all(&p).unwrap();
+        p
+    }
+
+    fn cli_with(args: &[&str]) -> Cli {
+        let mut argv: Vec<String> = vec!["basta".into()];
+        argv.extend(args.iter().map(|s| (*s).to_string()));
+        argv.push("--".into());
+        argv.push("true".into());
+        <Cli as clap::Parser>::parse_from(argv)
+    }
+
+    fn no_seeds() -> SeedSet {
+        SeedSet {
+            dirs: vec![],
+            files: vec![],
+            hosts: None,
+            resolv: None,
+        }
+    }
+
+    fn argv_for(args: &[&str]) -> Vec<String> {
+        build(&cli_with(args), &[], Path::new("/tmp"), &[], &no_seeds()).unwrap()
+    }
+
+    fn pair_pos(argv: &[String], flag: &str, arg: &str) -> Option<usize> {
+        argv.windows(2).position(|w| w[0] == flag && w[1] == arg)
+    }
+
+    fn assert_pair(argv: &[String], flag: &str, arg: &str) {
+        assert!(
+            pair_pos(argv, flag, arg).is_some(),
+            "missing `{flag} {arg}` in {argv:?}"
+        );
+    }
+
+    fn has(argv: &[String], item: &str) -> bool {
+        argv.iter().any(|a| a == item)
+    }
+
+    fn home() -> String {
+        crate::env::host_home().unwrap()
+    }
+
+    #[test]
+    fn usr_and_etc_are_always_read_only() {
+        let argv = argv_for(&[]);
+        assert_pair(&argv, "--ro-bind", "/usr");
+        assert_pair(&argv, "--ro-bind", "/etc");
+        for flag in ["--bind", "--bind-try", "--dev-bind", "--dev-bind-try"] {
+            for dir in ["/usr", "/etc"] {
+                assert!(
+                    pair_pos(&argv, flag, dir).is_none(),
+                    "{dir} must never be bound writable ({flag})"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn proc_and_dev_are_synthesised_and_masked() {
+        let argv = argv_for(&[]);
+        assert_pair(&argv, "--proc", "/proc");
+        assert_pair(&argv, "--dev", "/dev");
+        for dest in [
+            "/proc/1/cmdline",
+            "/proc/1/environ",
+            "/proc/1/task/1/cmdline",
+            "/proc/1/task/1/environ",
+            "/dev/console",
+            "/dev/tty",
+        ] {
+            let masked = argv
+                .windows(3)
+                .any(|w| w[0] == "--ro-bind" && w[1] == "/dev/null" && w[2] == dest);
+            assert!(masked, "{dest} not null-bound");
+        }
+        // procfs must be mounted before the null-binds layer onto it.
+        assert!(
+            pair_pos(&argv, "--proc", "/proc").unwrap()
+                < pair_pos(&argv, "--ro-bind", "/dev/null").unwrap()
+        );
+    }
+
+    #[test]
+    fn ro_workspace_binds_by_fd_read_only() {
+        let root = scratch("ws-ro");
+        let ws = vec![Workspace::resolve(&format!("{}:ro", root.to_str().unwrap())).unwrap()];
+        let fd = ws[0].fd.as_raw_fd().to_string();
+        let argv = build(&cli_with(&[]), &ws, &root, &[], &no_seeds()).unwrap();
+        let i = pair_pos(&argv, "--ro-bind-fd", &fd).expect("no --ro-bind-fd for :ro workspace");
+        assert_eq!(argv[i + 2], ws[0].path.to_string_lossy());
+        assert!(
+            pair_pos(&argv, "--bind-fd", &fd).is_none(),
+            "a :ro workspace must never be RW-bound"
+        );
+    }
+
+    #[test]
+    fn rw_workspace_binds_by_fd_writable() {
+        let root = scratch("ws-rw");
+        let ws = vec![Workspace::resolve(root.to_str().unwrap()).unwrap()];
+        let fd = ws[0].fd.as_raw_fd().to_string();
+        let dest = ws[0].path.to_string_lossy().into_owned();
+        let argv = build(&cli_with(&[]), &ws, &root, &[], &no_seeds()).unwrap();
+        let i = pair_pos(&argv, "--bind-fd", &fd).expect("no --bind-fd for RW workspace");
+        assert_eq!(argv[i + 2], dest);
+        assert!(pair_pos(&argv, "--ro-bind-fd", &fd).is_none());
+        assert_pair(&argv, "--chdir", &dest);
+    }
+
+    #[test]
+    fn clearenv_precedes_every_setenv() {
+        let envs = vec![crate::env::EnvSpec::parse("FOO=bar").unwrap()];
+        let argv = build(&cli_with(&[]), &[], Path::new("/tmp"), &envs, &no_seeds()).unwrap();
+        let clear = argv.iter().position(|a| a == "--clearenv").unwrap();
+        let first = argv.iter().position(|a| a == "--setenv").unwrap();
+        assert!(clear < first, "a --setenv before --clearenv would be wiped");
+        assert_eq!(argv.iter().filter(|a| *a == "--clearenv").count(), 1);
+        let i = pair_pos(&argv, "--setenv", "FOO").unwrap();
+        assert_eq!(argv[i + 2], "bar");
+    }
+
+    #[test]
+    fn always_sets_uid_gid_and_drops_all_caps() {
+        let uid = nix::unistd::geteuid().as_raw().to_string();
+        let gid = nix::unistd::getegid().as_raw().to_string();
+        for args in [&[][..], &["--net", "host"][..], &["--gpu"][..]] {
+            let argv = argv_for(args);
+            assert_pair(&argv, "--uid", &uid);
+            assert_pair(&argv, "--gid", &gid);
+            assert_pair(&argv, "--cap-drop", "ALL");
+        }
+    }
+
+    #[test]
+    fn unshares_every_namespace() {
+        let argv = argv_for(&[]);
+        for f in [
+            "--unshare-user",
+            "--unshare-ipc",
+            "--unshare-pid",
+            "--unshare-uts",
+            "--unshare-cgroup",
+            "--die-with-parent",
+            "--new-session",
+        ] {
+            assert!(has(&argv, f), "missing {f}");
+        }
+    }
+
+    #[test]
+    fn offline_unshares_net_host_shares_it() {
+        let off = argv_for(&[]);
+        assert!(has(&off, "--unshare-net") && !has(&off, "--share-net"));
+        let host = argv_for(&["--net", "host"]);
+        assert!(has(&host, "--share-net") && !has(&host, "--unshare-net"));
+    }
+
+    #[test]
+    fn egress_shares_net_and_binds_the_hosts_overlay() {
+        // The netns is already unshared by the Rust child; bwrap must keep it
+        // (--share-net), not silently make a fresh empty one.
+        let seeds = SeedSet {
+            dirs: vec![],
+            files: vec![],
+            hosts: Some(
+                crate::seed::Seed::overlay("/etc/hosts", b"127.0.0.1 localhost\n").unwrap(),
+            ),
+            resolv: None,
+        };
+        let argv = build(&cli_with(&[]), &[], Path::new("/tmp"), &[], &seeds).unwrap();
+        assert!(has(&argv, "--share-net") && !has(&argv, "--unshare-net"));
+        let fd = seeds.hosts.as_ref().unwrap().fd.as_raw_fd().to_string();
+        let i = pair_pos(&argv, "--ro-bind-data", &fd).expect("hosts overlay not bound");
+        assert_eq!(argv[i + 2], "/etc/hosts");
+    }
+
+    #[test]
+    fn home_is_a_tmpfs_never_bound() {
+        let home = home();
+        let argv = argv_for(&[]);
+        assert_pair(&argv, "--tmpfs", &home);
+        for flag in ["--bind", "--ro-bind", "--bind-try", "--ro-bind-try"] {
+            assert!(
+                pair_pos(&argv, flag, &home).is_none(),
+                "host $HOME must never be bound ({flag})"
+            );
+        }
+        for t in ["/tmp", "/var/tmp", "/run"] {
+            assert_pair(&argv, "--tmpfs", t);
+        }
+        let i = pair_pos(&argv, "--setenv", "HOME").unwrap();
+        assert_eq!(argv[i + 2], home);
+    }
+
+    #[test]
+    fn gpu_is_opt_in() {
+        let off = argv_for(&[]);
+        assert!(
+            !off.iter().any(|a| a.contains("nvidia")),
+            "GPU exposed without --gpu"
+        );
+        let on = argv_for(&["--gpu"]);
+        for dev in [
+            "nvidiactl",
+            "nvidia-uvm",
+            "nvidia-uvm-tools",
+            "nvidia-modeset",
+        ] {
+            assert_pair(&on, "--dev-bind-try", &format!("/dev/{dev}"));
+        }
+    }
+
+    #[test]
+    fn local_share_exposure_is_opt_in() {
+        let home = home();
+        let whole = format!("{home}/.local/share");
+        let argv = argv_for(&[]);
+        assert_pair(&argv, "--ro-bind-try", &format!("{whole}/mise"));
+        assert!(
+            pair_pos(&argv, "--ro-bind-try", &whole).is_none(),
+            "whole ~/.local/share exposed without --expose-local-share (F34)"
+        );
+        assert_pair(
+            &argv_for(&["--expose-local-share"]),
+            "--ro-bind-try",
+            &whole,
+        );
+    }
+
+    #[test]
+    fn workspaces_are_emitted_after_the_home_tmpfs() {
+        // Documents the ordering contract workspace::reject_masking guards:
+        // a workspace bind wins over every mount emitted before it.
+        let root = scratch("order");
+        let ws = vec![Workspace::resolve(root.to_str().unwrap()).unwrap()];
+        let fd = ws[0].fd.as_raw_fd().to_string();
+        let argv = build(&cli_with(&[]), &ws, &root, &[], &no_seeds()).unwrap();
+        let bind = pair_pos(&argv, "--bind-fd", &fd).unwrap();
+        assert!(pair_pos(&argv, "--tmpfs", &home()).unwrap() < bind);
+        assert!(pair_pos(&argv, "--ro-bind", "/usr").unwrap() < bind);
+    }
+
+    #[test]
+    fn print_redacts_caller_env_values() {
+        let envs = vec![crate::env::EnvSpec::parse("SECRET=hunter2").unwrap()];
+        let argv = build(&cli_with(&[]), &[], Path::new("/tmp"), &envs, &no_seeds()).unwrap();
+        let out = render(&argv);
+        assert!(!out.contains("hunter2"), "secret leaked: {out}");
+        assert!(out.contains("--setenv SECRET <redacted>"));
+    }
+
+    #[test]
+    fn print_shows_bastas_own_env_verbatim() {
+        let out = render(&argv_for(&[]));
+        assert!(out.contains(&format!("--setenv HOME {}", shell_quote(&home()))));
+        assert!(!out.contains("--setenv PATH <redacted>"));
+    }
+
+    #[test]
+    fn print_redaction_survives_a_setenv_shaped_value() {
+        let envs = vec![
+            crate::env::EnvSpec::parse("A=--setenv").unwrap(),
+            crate::env::EnvSpec::parse("B=leakme").unwrap(),
+        ];
+        let argv = build(&cli_with(&[]), &[], Path::new("/tmp"), &envs, &no_seeds()).unwrap();
+        assert!(
+            !render(&argv).contains("leakme"),
+            "redaction desynchronised by a --setenv-shaped value"
+        );
+    }
+
+    #[test]
+    fn safe_setenv_never_exposes_a_caller_supplied_key() {
+        // The redaction is only sound while every SAFE_SETENV key is also
+        // reserved — otherwise a caller could name --env after one and have
+        // its value printed verbatim.
+        for k in SAFE_SETENV {
+            assert!(
+                crate::env::EnvSpec::parse(&format!("{k}=x")).is_err(),
+                "{k} is printed verbatim but not reserved in env.rs"
+            );
+        }
+    }
+
+    #[test]
+    fn shell_quote_quotes_only_when_needed() {
+        assert_eq!(shell_quote("/usr/bin"), "/usr/bin");
+        assert_eq!(shell_quote(""), "''");
+        assert_eq!(shell_quote("a b"), "'a b'");
+        assert_eq!(shell_quote("it's"), "'it'\\''s'");
+        assert_eq!(shell_quote("$(id)"), "'$(id)'");
+    }
+
+    #[test]
+    fn to_memfd_writes_nul_separated_args() {
+        use std::io::Read;
+        let fd = to_memfd(&["--a".to_string(), "b c".to_string()]).unwrap();
+        let mut buf = Vec::new();
+        std::fs::File::from(fd).read_to_end(&mut buf).unwrap();
+        assert_eq!(buf, b"--a\0b c\0");
+    }
+
+    #[test]
+    fn sealed_memfd_refuses_further_writes() {
+        let fd = sealed_memfd("basta-test", b"x").unwrap();
+        assert!(nix::unistd::write(fd.as_fd(), b"y").is_err());
+    }
 }

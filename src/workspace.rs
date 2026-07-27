@@ -40,6 +40,63 @@ impl Workspace {
     }
 }
 
+/// Refuse a workspace that would mask a mount basta manages itself.
+///
+/// bwrap applies operations in argv order and workspaces are emitted LAST
+/// (argv.rs), so a workspace bind layers over everything before it. A
+/// workspace at `$HOME` therefore puts the host home back over the fresh
+/// tmpfs — exposing `~/.ssh` and letting the agent write `~/.local/bin`,
+/// which is first on both the sandbox PATH and the caller's login PATH. That
+/// silently defeats the sandbox's headline guarantee, so it is refused rather
+/// than warned about. `$HOME` itself is the mount; an ancestor of it (`/`,
+/// `/home`) would swallow it whole — both are rejected.
+///
+/// `/tmp`, `/var/tmp` and `/run` are also basta tmpfs mounts, but binding the
+/// host's over them exposes no credentials and is an established way to hand
+/// the sandbox a scratch dir, so those only warn.
+pub fn reject_masking(workspaces: &[Workspace], home: &Path) -> Result<()> {
+    for w in workspaces {
+        if w.path == home || home.starts_with(&w.path) {
+            bail!(
+                "workspace '{}' is $HOME (or contains it): it would be bound over the \
+                 sandbox's fresh tmpfs $HOME, exposing host credentials (~/.ssh) and \
+                 letting the agent write ~/.local/bin, which is on your login PATH. \
+                 Bind the specific project directory instead.",
+                w.path.display()
+            );
+        }
+        for masked in ["/tmp", "/var/tmp", "/run"] {
+            if w.path == Path::new(masked) {
+                eprintln!(
+                    "basta: WARNING workspace '{masked}' replaces the sandbox's private \
+                     tmpfs {masked} with the host's — host temp files are visible and \
+                     writable. Bind a subdirectory instead for an isolated scratch space."
+                );
+            }
+        }
+    }
+    // A later read-write workspace that contains an earlier `:ro` one silently
+    // re-opens it for writing (same last-wins ordering), and lockset.rs skips
+    // `:ro` workspaces, so the git-autorun lock does not cover it either.
+    for (i, ro) in workspaces.iter().enumerate() {
+        if !ro.ro {
+            continue;
+        }
+        for rw in workspaces.iter().skip(i + 1).filter(|w| !w.ro) {
+            if ro.path.starts_with(&rw.path) {
+                bail!(
+                    "workspace '{}' is read-write and contains the read-only workspace \
+                     '{}': the later bind wins, so ':ro' would not hold. Reorder them or \
+                     bind a narrower path.",
+                    rw.path.display(),
+                    ro.path.display()
+                );
+            }
+        }
+    }
+    Ok(())
+}
+
 fn check_allowed_root(path: &Path) -> Result<()> {
     // Where a workspace may live. Generic FHS default; extend for site
     // paths (cluster NFS, scratch, data mounts) by exporting a custom
@@ -117,6 +174,47 @@ mod tests {
     #[test]
     fn empty_root_segment_ignored() {
         assert!(!path_under_any_root(Path::new("/etc"), "::"));
+    }
+
+    fn ws(path: &str, ro: bool) -> Workspace {
+        let p = std::env::temp_dir().join(format!("basta-ws-{}", std::process::id()));
+        std::fs::create_dir_all(&p).unwrap();
+        Workspace {
+            fd: open(
+                &p,
+                OFlag::O_PATH | OFlag::O_DIRECTORY | OFlag::O_CLOEXEC,
+                Mode::empty(),
+            )
+            .unwrap(),
+            path: PathBuf::from(path),
+            ro,
+        }
+    }
+
+    #[test]
+    fn home_workspace_is_refused() {
+        let home = Path::new("/home/u");
+        // $HOME itself, and any ancestor that would swallow it.
+        assert!(reject_masking(&[ws("/home/u", false)], home).is_err());
+        assert!(reject_masking(&[ws("/home", false)], home).is_err());
+        assert!(reject_masking(&[ws("/", false)], home).is_err());
+        // A project dir inside $HOME is the normal case and must still work.
+        assert!(reject_masking(&[ws("/home/u/proj", false)], home).is_ok());
+        // A read-only bind of $HOME masks the tmpfs just the same.
+        assert!(reject_masking(&[ws("/home/u", true)], home).is_err());
+    }
+
+    #[test]
+    fn rw_workspace_containing_an_ro_one_is_refused() {
+        let home = Path::new("/home/u");
+        let nested = [ws("/tmp/a/inner", true), ws("/tmp/a", false)];
+        assert!(reject_masking(&nested, home).is_err());
+        // The reverse order is fine: the :ro bind lands last and wins.
+        let ordered = [ws("/tmp/a", false), ws("/tmp/a/inner", true)];
+        assert!(reject_masking(&ordered, home).is_ok());
+        // Siblings never conflict.
+        let siblings = [ws("/tmp/a", true), ws("/tmp/b", false)];
+        assert!(reject_masking(&siblings, home).is_ok());
     }
 
     #[test]
