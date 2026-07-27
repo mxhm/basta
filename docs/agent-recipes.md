@@ -13,13 +13,17 @@ Each recipe is the basta flags to launch one coding-agent CLI. Four things to se
   (basta is the boundary); flag per agent below.
 - **Locked config**: the workspace lock makes `.claude` / `.vscode` /
   `.mcp.json` read-only; `--unlock .claude` etc.
+- **Web UI**: a harness that serves a local web UI a host browser must reach
+  (e.g. openscience) needs `--publish PORT` — it forwards host `127.0.0.1:PORT`
+  into the sandbox's `127.0.0.1:PORT` (loopback-scoped), while egress stays
+  filtered. See [OpenScience](#openscience-wopenscience).
 
 The API key is visible inside the sandbox; the egress allowlist limits where it can be sent.
 
 ## Recipes
 
 Each is a complete command; replace `<workspace>` and `<task>`. Verified under
-basta 0.1.0.
+basta 0.1.2.
 
 **To add a recipe:** copy a block and fill in the four parts: egress endpoints,
 auth `--seed`s, the own-sandbox-off flag, and the command.
@@ -102,3 +106,76 @@ basta --allow-loopback 8000 --env LLAMACPP_API_KEY \
 
 Point the agent's base URL at `http://127.0.0.1:<port>`. `--env LLAMACPP_API_KEY`
 (no `=value`) forwards a server key from your shell, so it isn't written to disk.
+
+### OpenScience (`wopenscience`)
+
+Autonomous research agent with a **local web UI** (Bun server on `127.0.0.1:4096`)
+that autonomously **writes and runs code** (bash/Python/R/Jupyter). OpenScience is
+*not* a security boundary (its own docs say run it in a container/VM) and defaults to
+auto-allowing every tool call — so basta is the sole containment. Two basta defaults
+carry the safety here: the **env scrub** (only `ANTHROPIC_API_KEY` crosses in; every
+other host credential — AWS/GitHub/Modal/… — is stripped) and the **tmpfs `$HOME`**
+(the host's real `$HOME` is invisible; only the paths bound below exist inside).
+
+**UI:** `--publish 4096` forwards host `127.0.0.1:4096` into the sandbox so your
+browser reaches the workspace. Keep the sandbox port equal to the host port so the
+auto-opened `http://localhost:4096` resolves; `--port 4096` pins OpenScience to it.
+
+**Egress (open — the full toolbox):** the model provider, web search, the
+literature/bio databases, and the package registries. The command below covers the
+common connectors; OpenScience ships ~30 science connectors in total (chemistry,
+omics, pathways, more genomics). For the rest, read the hostnames out of its
+`science/connectors/**` sources — do **not** use OpenScience's own
+`settings/network.ts` allowlist, which is advisory-only and lists hosts the code
+doesn't actually fetch (it says `files.rcsb.org` where the code calls
+`data.rcsb.org`). Trim any group you don't want (registries block installs; a missing
+DB host just disables that connector). `api.anthropic.com` is the Anthropic SDK
+default; swap/add `api.openai.com`, `generativelanguage.googleapis.com`,
+`openrouter.ai` for other providers.
+
+```
+basta --publish 4096 \
+    --allow-sni api.anthropic.com \
+    --allow-sni mcp.exa.ai \
+    --allow-sni export.arxiv.org --allow-sni api.crossref.org --allow-sni doi.org \
+    --allow-sni api.openalex.org --allow-sni api.semanticscholar.org \
+    --allow-sni europepmc.org --allow-sni api.biorxiv.org \
+    --allow-sni eutils.ncbi.nlm.nih.gov --allow-sni www.ncbi.nlm.nih.gov \
+    --allow-sni pubmed.ncbi.nlm.nih.gov --allow-sni pubchem.ncbi.nlm.nih.gov \
+    --allow-sni www.ebi.ac.uk --allow-sni alphafold.ebi.ac.uk \
+    --allow-sni rest.uniprot.org --allow-sni data.rcsb.org --allow-sni search.rcsb.org \
+    --allow-sni rest.ensembl.org --allow-sni string-db.org \
+    --allow-sni reactome.org --allow-sni rest.kegg.jp \
+    --allow-sni pypi.org --allow-sni files.pythonhosted.org \
+    --allow-sni registry.npmjs.org --allow-sni conda.anaconda.org \
+    --allow-sni cran.r-project.org \
+    --allow-sni github.com --allow-sni raw.githubusercontent.com \
+    --env ANTHROPIC_API_KEY \
+    --env OPENSCIENCE_DISABLE_MODELS_FETCH=1 \
+    ~/.openscience:ro ~/.openscience/state \
+    ~/.config/openscience ~/.local/share/openscience \
+    <workspace> \
+    -- openscience --port 4096 "<goal>"
+```
+
+`~/.openscience:ro` binds the ~152 MB binary read-only (a bind, **not** `--seed` —
+seed copies into tmpfs RAM); `~/.openscience/state` layers RW over it.
+`OPENSCIENCE_DISABLE_MODELS_FETCH=1` drops the `models.dev` fetch. The state dirs are
+host paths, so login/sessions survive across runs; drop them for an ephemeral session.
+
+**Residual egress holes (open by design here):** OpenScience's `webfetch` tool fetches
+any URL the model picks, and user-configured MCP servers dial arbitrary hosts. nft
+still drops anything off the allowlist, and the env scrub means there are no stray
+creds to exfil — but any *allowed* host doubles as an exfil channel. To tighten: drop
+the registry lines (block installs, pre-provision a fixed env instead), disable
+`webfetch` in `openscience.json`, and leave MCP unconfigured. Harden `openscience.json`
+too: `permission.bash: "ask"` to override the auto-allow default, and don't log into
+Atlas (BYOK/local only).
+
+**MCP OAuth:** `--publish` takes a single port, so the fixed MCP-OAuth callback
+(`127.0.0.1:19876`) cannot be published in the same launch — leave MCP unconfigured,
+or use the UI port for the workspace and complete MCP auth outside the sandbox.
+**GPU:** add `--gpu` only on a GPU box for real local compute; the app itself needs
+none. **io_uring:** basta's seccomp denylist blocks `io_uring*`, but the Bun binary
+starts fine under it (verified); if a future build errors on `io_uring_setup`, add
+`--allow-syscall io_uring_setup,io_uring_enter,io_uring_register`.

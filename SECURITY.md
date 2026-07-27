@@ -17,7 +17,8 @@ In scope: a sandboxed process reaching a host path that wasn't bound (or writing
 read-only / workspace-lock target); reaching a destination not permitted by
 `--allow*` or modifying the in-netns nftables rules; escaping the namespaces,
 regaining capabilities, or defeating seccomp; a planted autorun file the host
-later runs despite the workspace lock.
+later runs despite the workspace lock; `--publish` binding any address other than
+host `127.0.0.1`, or forwarding a port that was not requested.
 
 Out of scope (documented non-goals — see README "Security model" / "Limits"):
 kernel exploits, side channels, a compromised host user, unknown malware (use a

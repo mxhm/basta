@@ -168,7 +168,8 @@ elif [ "$PM" != "unknown" ] && install_pkgs passt >/dev/null 2>&1; then
     echo "  ✓ passt installed — filtered egress available"
 else
     echo "  WARN: passt/pasta not available from the package manager — filtered"
-    echo "        egress (--allow / --allow-sni / --allow-loopback) will not work."
+    echo "        egress (--allow / --allow-sni / --allow-loopback) and --publish"
+    echo "        will not work."
     echo "        Offline sandboxing is unaffected. Install 'passt' from backports"
     echo "        or source to enable egress."
 fi

@@ -2,7 +2,7 @@
 # basta-verify — prove the basta sandbox denies what it should deny.
 #
 # Categories (default: all except --gpu-present):
-#   --host         Host inventory: deps + AppArmor; no v0.2/v0.3 leftovers.
+#   --host         Host inventory: deps + AppArmor profiles.
 #   --network      --allow egress: allowed dest reachable, others blocked,
 #                  offline default blocked, --allow :53/udp enables DNS.
 #   --sni          --allow-sni egress: allowed SNI reachable; off-allowlist
@@ -14,7 +14,8 @@
 #                  dev syscalls intact, 32-bit (i386-ABI) binaries killed.
 #   --gpu-absent   By default (GPU off), /dev/nvidia* must not be present.
 #   --gpu-present  With --gpu, nvidia-smi must work.
-#   --audit        Replay proc/netns findings (F8 F9 F14 F15 F16 F17 F18).
+#   --audit        Replay proc/netns findings (F8 F9 F14 F15 F16 F17 F18);
+#                  --publish reaches the sandbox on host loopback only.
 #
 # The --network and --audit egress probes reach the public internet. The
 # "allowed host is reachable" canary must be a host your egress policy actually
@@ -128,7 +129,7 @@ egress_baseline_hint() {
 # --- host inventory ---
 if [ "$do_host" = "1" ]; then
     echo ""
-    echo "[host] inventory: deps + AppArmor; no v0.2/v0.3 leftovers."
+    echo "[host] inventory: deps + AppArmor profiles."
 
     check "basta binary is ELF (Rust build)" \
         bash -c 'file "$BASTA" | grep -q ELF'
@@ -682,6 +683,37 @@ s.connect(b'\\0/org/kernel/linux/storage/multipathd')"
         /usr/bin/curl -sS --max-time 5 -o /dev/null "http://127.0.0.1:$ah_port/"
     kill "$ah_pid" 2>/dev/null || true
     wait "$ah_pid" 2>/dev/null || true
+
+    # --publish: the reverse direction. A host connection to 127.0.0.1:PORT
+    # must reach the sandboxed server, and the SAME port on a routable host
+    # address must not — publish is pinned to 127.0.0.1/PORT, and a bare port
+    # would bind 0.0.0.0 and expose the service to the LAN. Asserted from the
+    # host (not via probe(), which runs its command inside the sandbox).
+    pub_port=49232
+    "$BASTA" --publish "$pub_port" /tmp -- \
+        /usr/bin/python3 -m http.server "$pub_port" --bind 127.0.0.1 \
+        >/dev/null 2>&1 &
+    pub_pid=$!
+    sleep 3
+    if curl -sS --max-time 5 -o /dev/null "http://127.0.0.1:$pub_port/" 2>/dev/null; then
+        echo "  ok      ALLOWED host 127.0.0.1:$pub_port -> sandbox via --publish"
+        pub_lan=$(hostname -I 2>/dev/null | awk '{print $1}')
+        if [ -n "$pub_lan" ]; then
+            if curl -sS --max-time 3 -o /dev/null "http://$pub_lan:$pub_port/" 2>/dev/null; then
+                echo "  FAIL    --publish bound a non-loopback address ($pub_lan:$pub_port, leak!)"
+                fails=$((fails+1))
+            else
+                echo "  ok      BLOCKED $pub_lan:$pub_port (--publish is loopback-scoped)"
+            fi
+        else
+            echo "  ok      --publish loopback-scope probe skipped (no routable address)"
+        fi
+    else
+        echo "  FAIL    --publish did not expose the sandbox service on host loopback"
+        fails=$((fails+1))
+    fi
+    kill "$pub_pid" 2>/dev/null || true
+    wait "$pub_pid" 2>/dev/null || true
 fi
 
 echo ""

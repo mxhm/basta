@@ -2,19 +2,31 @@
 
 All notable changes to basta are documented here. Versions follow SemVer; basta is pre-1.0.
 
+## [0.1.2] — 2026-07
+
+- **`--publish PORT`** — forward host `127.0.0.1:PORT` into the sandbox so a host
+  browser can reach a web UI served inside. One port, host loopback only; egress
+  stays gated by `--allow*`. A published port is unauthenticated to every local
+  user — see README "Security model".
+- **Diagnostics** — a `pasta` startup failure now reports its actual error
+  instead of a downstream "no default route in the sandbox netns".
+- **basta-verify** — probe that `--publish` reaches the sandbox on host loopback
+  and nowhere else.
+- **Docs** — document `--publish`; add an OpenScience recipe; `make lint` now
+  runs `cargo fmt --check`, matching CI.
+
 ## [0.1.1] — 2026-06
 
 - **AppArmor** — the `bwrap` profile attaches to every path `find_bin` resolves
-  bwrap from, not just `/usr/bin/bwrap`, so a non-standard bwrap install is not
-  left unconfined (which fails userns creation under the Ubuntu userns gate).
-- **basta-host-setup** — use `pacman -S` instead of `pacman -Sy` (partial-upgrade
-  hazard), with a hint to run `pacman -Syu` if a package is missing.
+  bwrap from, not just `/usr/bin/bwrap`, so a non-standard bwrap install is no
+  longer left unconfined (which broke userns creation under the Ubuntu gate).
+- **basta-host-setup** — `pacman -S` instead of `pacman -Sy` (partial-upgrade
+  hazard).
 - **basta-verify** — probe that the installed bwrap profile covers the resolved
   bwrap path.
-- **Docs** — describe the always-read-only `/usr` and `/etc` host surface and what
-  `/etc` exposes; note `ptrace`/`perf_event_open` are kept by default and how to
-  drop them; note basta-verify is not hermetic; clarify the workspace-lock exit
-  warning is advisory.
+- **Docs** — describe the always-read-only `/usr` and `/etc` host surface; note
+  `ptrace`/`perf_event_open` are on by default and how to drop them; note
+  basta-verify is not hermetic and the workspace-lock exit warning is advisory.
 
 ## [0.1.0] — 2026-06
 

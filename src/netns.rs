@@ -35,6 +35,7 @@ pub fn run_egress(
     let ruleset = egress.nft_ruleset();
     let proxy_sni = egress.sni_enabled().then(|| egress.sni.clone());
     let allow_loopback = cli.allow_loopback.clone();
+    let publish = cli.publish;
 
     pty::run(
         argv,
@@ -42,7 +43,9 @@ pub fn run_egress(
         workspaces,
         seeds,
         move || child_unshare_filter_wait(ready_w, go_r, &ruleset),
-        move |child_pid| parent_spawn_support(child_pid, ready_r, go_w, proxy_sni, allow_loopback),
+        move |child_pid| {
+            parent_spawn_support(child_pid, ready_r, go_w, proxy_sni, allow_loopback, publish)
+        },
     )
 }
 
@@ -95,6 +98,7 @@ fn parent_spawn_support(
     go_w: OwnedFd,
     proxy_sni: Option<Vec<SniRule>>,
     allow_loopback: Vec<u16>,
+    publish: Option<u16>,
 ) -> Result<Vec<Child>> {
     let mut buf = [0u8; 1];
     let n = nix::unistd::read(ready_r.as_fd(), &mut buf).context("read child ready")?;
@@ -103,9 +107,18 @@ fn parent_spawn_support(
     }
 
     let mut support: Vec<Child> = vec![];
-    match spawn_pasta(child_pid, &allow_loopback) {
+    match spawn_pasta(child_pid, &allow_loopback, publish) {
         Ok(c) => support.push(c),
         Err(e) => return Err(e),
+    }
+    // pasta rejects a bad port spec (or fails to bind a --publish port) during
+    // argument/setup handling, i.e. within a few ms of exec. Catch that here,
+    // while we still hold its stderr: otherwise `spawn` reports success, the
+    // child's wait_for_default_route times out, and every such failure surfaces
+    // as an unrelated "no default route in the sandbox netns".
+    if let Some(err) = pasta_died_early(&mut support[0]) {
+        kill_all(&mut support);
+        bail!("pasta failed to configure the sandbox netns: {err}");
     }
     if let Some(sni) = proxy_sni {
         match spawn_sni_proxy(child_pid, &sni) {
@@ -136,29 +149,25 @@ fn kill_all(children: &mut Vec<Child>) {
 /// creates+configures a tap. `-f`: explicit foreground (the background
 /// default is TTY-dependent). `-m 1500`: pasta's 65520 default stalls
 /// real servers. The rest closes pasta's host-bridging defaults so it
-/// only NAT-translates the sandbox's outbound connections:
+/// only NAT-translates the sandbox's connections:
 ///   --no-map-gw   don't map the gateway address to the host;
-///   -t/-u none    no host->sandbox inbound port forwarding;
+///   -t none / -t 127.0.0.1/<port>   host->sandbox inbound TCP forwarding.
+///                 `none` by default. `--publish PORT` binds host
+///                 127.0.0.1:PORT and forwards it to the sandbox's
+///                 127.0.0.1:PORT (pasta translates loopback addresses), so
+///                 a host browser can reach an in-sandbox web UI. The address
+///                 qualifier is load-bearing: a bare `-t PORT` would bind
+///                 0.0.0.0 and expose the service to the LAN.
+///   -u none       no host->sandbox inbound UDP forwarding.
 ///   -T none / -T <ports>   sandbox->host-loopback TCP forwarding. `none`
 ///                 by default — the sandbox cannot reach host services
 ///                 on 127.0.0.1 (F17). `--allow-loopback PORT` re-enables
 ///                 it for exactly the listed ports.
 ///   -U none       no sandbox->host-loopback UDP forwarding.
-fn spawn_pasta(child_pid: Pid, allow_loopback: &[u16]) -> Result<Child> {
+fn spawn_pasta(child_pid: Pid, allow_loopback: &[u16], publish: Option<u16>) -> Result<Child> {
     let pasta = find_bin("pasta").context("pasta not found")?;
-    // -T: namespace->host TCP forwarding. `none` by default (F17 — the
-    // sandbox cannot reach host loopback services). Each --allow-loopback
-    // PORT adds exactly that port: the sandbox then reaches the host
-    // service at 127.0.0.1:PORT, and nothing else on the host.
-    let tcp_ns = if allow_loopback.is_empty() {
-        "none".to_string()
-    } else {
-        allow_loopback
-            .iter()
-            .map(u16::to_string)
-            .collect::<Vec<_>>()
-            .join(",")
-    };
+    let tcp_ns = loopback_spec(allow_loopback); // -T: sandbox -> host loopback
+    let tcp_in = publish_spec(publish); // -t: host loopback -> sandbox
     Command::new(&pasta)
         .args([
             "-f",
@@ -166,13 +175,12 @@ fn spawn_pasta(child_pid: Pid, allow_loopback: &[u16]) -> Result<Child> {
             "--no-map-gw",
             "-m",
             "1500",
-            "-t",
-            "none",
             "-u",
             "none",
             "-U",
             "none",
         ])
+        .args(["-t", tcp_in.as_str()])
         .args(["-T", tcp_ns.as_str()])
         .arg(child_pid.as_raw().to_string())
         .stdin(Stdio::null())
@@ -180,6 +188,64 @@ fn spawn_pasta(child_pid: Pid, allow_loopback: &[u16]) -> Result<Child> {
         .stderr(Stdio::piped())
         .spawn()
         .with_context(|| format!("spawning {}", pasta.display()))
+}
+
+/// `-T` spec: sandbox 127.0.0.1:PORT -> host 127.0.0.1:PORT. Bare ports; the
+/// forwarding target is implicitly host loopback. `none` when empty (F17 —
+/// the sandbox reaches no host loopback service by default).
+fn loopback_spec(ports: &[u16]) -> String {
+    if ports.is_empty() {
+        "none".to_string()
+    } else {
+        ports
+            .iter()
+            .map(u16::to_string)
+            .collect::<Vec<_>>()
+            .join(",")
+    }
+}
+
+/// `-t` spec: host 127.0.0.1:PORT -> sandbox 127.0.0.1:PORT. Address-qualified
+/// to loopback so pasta binds only the host's 127.0.0.1 — no other interface.
+/// `none` when unset (no inbound forwarding by default). Exactly one port:
+/// pasta's grammar carries the address once for the whole list, so a naive
+/// `addr/p1,addr/p2` join is rejected as an invalid port specifier.
+fn publish_spec(port: Option<u16>) -> String {
+    match port {
+        Some(p) => format!("127.0.0.1/{p}"),
+        None => "none".to_string(),
+    }
+}
+
+/// Non-blocking-ish check that pasta survived startup. Returns its stderr when
+/// it already exited (bad `-t`/`-T` spec, port in use, permission denied), so
+/// the real cause reaches the user instead of a downstream route timeout.
+fn pasta_died_early(child: &mut Child) -> Option<String> {
+    // pasta parses arguments and binds forwarded ports immediately; a failure
+    // is visible well inside this window, which is noise next to the launch's
+    // own bwrap+netns setup cost.
+    for _ in 0..6 {
+        std::thread::sleep(Duration::from_millis(25));
+        match child.try_wait() {
+            Ok(Some(_)) => {
+                let mut err = String::new();
+                if let Some(mut se) = child.stderr.take() {
+                    let _ = std::io::Read::read_to_string(&mut se, &mut err);
+                }
+                let msg = err
+                    .lines()
+                    .filter(|l| !l.trim().is_empty())
+                    .next_back()
+                    .unwrap_or("pasta exited during startup")
+                    .trim()
+                    .to_string();
+                return Some(msg);
+            }
+            Ok(None) => {}
+            Err(_) => return None,
+        }
+    }
+    None
 }
 
 /// Re-exec this basta binary as `basta __sni-proxy`, hand it the config on
@@ -410,4 +476,31 @@ pub fn find_bin(name: &str) -> Option<PathBuf> {
         }
     }
     None
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{loopback_spec, publish_spec};
+
+    #[test]
+    fn empty_specs_are_none() {
+        assert_eq!(loopback_spec(&[]), "none");
+        assert_eq!(publish_spec(None), "none");
+    }
+
+    #[test]
+    fn loopback_spec_joins_bare_ports() {
+        // -T carries no address: the target is implicitly host loopback, and
+        // pasta accepts a bare comma list here (unlike -t, see publish_spec).
+        assert_eq!(loopback_spec(&[8000]), "8000");
+        assert_eq!(loopback_spec(&[8000, 8080]), "8000,8080");
+    }
+
+    #[test]
+    fn publish_spec_is_loopback_scoped() {
+        // The 127.0.0.1/ qualifier is the security property: a bare port would
+        // bind 0.0.0.0 and expose the sandboxed service to the LAN.
+        assert_eq!(publish_spec(Some(4096)), "127.0.0.1/4096");
+        assert_eq!(publish_spec(Some(65535)), "127.0.0.1/65535");
+    }
 }

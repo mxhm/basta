@@ -55,6 +55,7 @@ test:
 	$(CARGO) test --target $(TARGET)
 
 lint:
+	$(CARGO) fmt --check
 	$(CARGO) clippy --target $(TARGET) -- -D warnings
 	@if command -v shellcheck >/dev/null 2>&1; then shellcheck --severity=warning $(BASH_BINS); else echo "shellcheck not installed"; fi
 

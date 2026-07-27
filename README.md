@@ -38,7 +38,7 @@ The tradeoff: basta fixes the boundary at launch rather than vetting each action
 inside it. A few things are caught by watch-and-warn rather than blocked up
 front (see [Security model](#security-model)).
 
-First public release: self-reviewed, not independently audited.
+Self-reviewed, not independently audited.
 
 I built basta mainly to understand agent sandboxes and my own needs. Once set
 up, [nono](https://github.com/always-further/nono) and
@@ -147,6 +147,7 @@ one (survives across runs). `DEST` resolves under `$HOME`.
 | `--allow HOST:PORT[-PORT][/tcp\|udp]` | Allow egress to an IP, CIDR, or DNS name; refuses unsafe forms (see [Network](#network)). Comma-separated, repeatable. |
 | `--allow-sni HOST` | Allow TLS egress to `HOST:443` by ClientHello SNI. Comma-separated, repeatable. |
 | `--allow-loopback PORT` | Allow the sandbox to reach a host service at `127.0.0.1:PORT`. Comma-separated, repeatable. |
+| `--publish PORT` | Forward host `127.0.0.1:PORT` into the sandbox, so a host browser can reach a web UI served inside. One port; loopback-only. |
 | `--net none\|host` | `none` (default, offline) or `host` (no isolation). |
 | `--seed SRC:DEST` | Copy a host path into `$HOME`; ephemeral. |
 | `--persist SRC:DEST` | RW-bind a host path into `$HOME`; survives. |
@@ -183,6 +184,14 @@ launch:
   the host's own addresses, so a same-machine service is only reachable by
   forwarding `127.0.0.1:PORT` to the host's. This is a broad grant: the agent gets
   whatever that (often unauthenticated) port exposes. (Different host → `--allow <ip>:PORT`.)
+- **`--publish`**: the one *inbound* flag — it forwards host `127.0.0.1:PORT`
+  into the sandbox's `127.0.0.1:PORT`, for a harness that serves a web UI a host
+  browser must reach (an agent workbench, a notebook). Bound on host loopback
+  only, never a LAN interface, and egress stays filtered — but **every local
+  user on the machine can reach that service**, and inbound connections are not
+  covered by the egress allowlist (see [Security model](#security-model)). One
+  port per launch; without it, a browser-driven harness would need `--net host`
+  and lose all filtering.
 - **`--net host`**: share the host network; no isolation, no egress filtering.
   A last resort, not the fix for a local model (use `--allow-loopback`).
 
@@ -257,7 +266,7 @@ override the targets with `BASTA_PROBE_HOST` / `BASTA_PROBE_HOST_IP` /
 `BASTA_PROBE_DNS` / `BASTA_PROBE_DNS_NAME`. basta-verify also skips probes whose
 prerequisites are absent (logged as `skipped`, never a silent pass), so a clean
 run on a bare host is not full coverage — the complete suite is meant to run on a
-known-good Linux image (see `research/vm-qc-harness.md`).
+known-good Linux image (a fresh VM per distro).
 
 `basta --build-rev` prints the git rev the binary was built from.
 
@@ -282,6 +291,17 @@ known-good Linux image (see `research/vm-qc-harness.md`).
   outer user namespace the agent can't reach, so it can't alter the filter. The
   SNI proxy self-sandboxes (seccomp, dropped capabilities). Services on the host
   itself are unreachable unless you open a port with `--allow-loopback`.
+- **`--publish` is the one inbound path, and it is unauthenticated.** It binds a
+  host `127.0.0.1:PORT` socket for the run — the only host-visible listening
+  socket basta creates — and forwards it into the sandbox. Loopback-scoped (never
+  a LAN interface), but loopback is not an authentication boundary: **any local
+  user or process on that machine can connect**, and what they reach is whatever
+  the sandboxed harness serves — for an agent workbench, an arbitrary
+  code-execution endpoint. The egress filter is an `output`-hook ruleset, so it
+  does not apply to inbound connections; a published port is a bidirectional
+  channel exempt from the `--allow` allowlist (the sandbox still cannot
+  *originate* egress through it). Publish only on a machine whose local users you
+  trust, and only a harness you meant to expose.
 - The agent runs under a seccomp **denylist**: `io_uring`, kernel keyrings,
   `bpf`, `userfaultfd`, `mount`, `unshare`/`setns`, and module loading return
   `EPERM`, and 32-bit (i386-ABI) binaries are killed. Developer syscalls
@@ -312,7 +332,11 @@ compromised host account. For unknown malware, use a VM.
 
 ## Limits
 
-- IPv4 only; IPv6 egress is dropped.
+- IPv4 only; IPv6 egress is dropped. `--publish` likewise binds IPv4 loopback
+  only, so a client that insists on `[::1]` won't connect (`localhost` and
+  browsers fall back to IPv4).
+- `--publish` takes one port, holds it on the host for the whole run (even if
+  nothing listens inside yet), and needs an unprivileged port (≥1024).
 - `--allow-sni` trusts a client-asserted name (see caveats above).
 - Resolve-at-launch DNS pins IPs for the session.
 - GPU is off by default; `--gpu` binds all `/dev/nvidia*` (all-or-nothing,

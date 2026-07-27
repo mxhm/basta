@@ -52,6 +52,16 @@ pub struct Cli {
     #[arg(long = "allow-loopback", value_name = "PORT", value_delimiter = ',')]
     pub allow_loopback: Vec<u16>,
 
+    /// Publish ONE in-sandbox TCP service on the host's loopback: a host
+    /// connection to 127.0.0.1:PORT is forwarded into the sandbox's
+    /// 127.0.0.1:PORT, so a host browser can reach a web UI served inside
+    /// (e.g. openscience on 4096). Enables filtered networking; egress
+    /// stays gated by --allow / --allow-sni (offline if neither is given).
+    /// Bound on 127.0.0.1 only — never a LAN interface — but note EVERY
+    /// local user on this machine can then reach that service.
+    #[arg(long = "publish", value_name = "PORT")]
+    pub publish: Option<u16>,
+
     /// Seed a host file or dir into the sandbox $HOME — writable but
     /// ephemeral (discarded on exit). SRC:DEST, repeatable. DEST is
     /// resolved under $HOME.
@@ -131,7 +141,10 @@ impl Cli {
     /// truth shared by `preflight` and the launch path (`main::run`), so the
     /// two cannot drift on which flags enable the netns/pasta path.
     pub fn egress_requested(&self) -> bool {
-        !self.allow.is_empty() || !self.allow_sni.is_empty() || !self.allow_loopback.is_empty()
+        !self.allow.is_empty()
+            || !self.allow_sni.is_empty()
+            || !self.allow_loopback.is_empty()
+            || self.publish.is_some()
     }
 
     pub fn preflight(&self) -> Result<()> {
@@ -141,8 +154,8 @@ impl Cli {
         if self.egress_requested() {
             if self.net == NetMode::Host {
                 bail!(
-                    "--allow / --allow-sni / --allow-loopback cannot be combined \
-                     with --net host (host mode shares the host netns — no \
+                    "--allow / --allow-sni / --allow-loopback / --publish cannot be \
+                     combined with --net host (host mode shares the host netns — no \
                      egress filtering)"
                 );
             }
@@ -153,6 +166,39 @@ impl Cli {
         }
         if self.allow_loopback.iter().any(|&p| p == 0) {
             bail!("--allow-loopback: port must be 1-65535");
+        }
+        if let Some(p) = self.publish {
+            // pasta binds the host-side listener unprivileged: port 0 is not a
+            // port, and <1024 needs CAP_NET_BIND_SERVICE it does not have.
+            // Both would otherwise surface as an opaque "no default route".
+            if p == 0 {
+                bail!("--publish: port must be 1-65535");
+            }
+            if p < 1024 {
+                bail!(
+                    "--publish {p}: ports below 1024 cannot be bound — basta and \
+                     pasta run unprivileged. Serve on a high port instead."
+                );
+            }
+            // The SNI proxy listens on 127.0.0.1:PROXY_PORT inside the netns;
+            // publishing it would hand every local user a forward proxy to the
+            // --allow-sni hosts. Refused unconditionally so enabling --allow-sni
+            // later can never turn a working launch into an exposure.
+            if p == crate::egress::PROXY_PORT {
+                bail!(
+                    "--publish {p}: reserved — basta's in-netns SNI proxy listens \
+                     on this port. Serve on a different port."
+                );
+            }
+            // -t and -T on the same port: pasta's own --allow-loopback listener
+            // occupies 127.0.0.1:P inside the netns, so the sandbox's server
+            // cannot bind it and an inbound connection hangs against pasta.
+            if self.allow_loopback.contains(&p) {
+                bail!(
+                    "--publish {p} conflicts with --allow-loopback {p}: a port \
+                     cannot be forwarded in both directions. Use different ports."
+                );
+            }
         }
 
         // --lock / --unlock take workspace-relative paths; reject absolute

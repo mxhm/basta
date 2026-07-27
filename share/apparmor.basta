@@ -14,8 +14,8 @@
 # not the sandboxed agent. The agent's confinement is bwrap's mount
 # namespace + nftables egress filter, not AppArmor on basta.
 #
-# The attachment must match the binary that actually runs. Since v0.5.6
-# the default install is the user prefix (~/.local/bin/basta), so the set
+# The attachment must match the binary that actually runs. The default
+# install is the user prefix (~/.local/bin/basta), so the set
 # below covers both that (under /home/*/ and /root) and system-wide
 # PREFIX=/usr/local and PREFIX=/usr (distro-package) installs. A profile
 # pinned only to one path leaves the others unconfined, and userns creation
